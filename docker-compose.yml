@@ -1,0 +1,147 @@
+services:
+  # SAM3 Gradio Web Interface
+  sam3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sam3-gradio
+    ports:
+      - "7860:7860"
+    volumes:
+      # Mount cache directories for model weights
+      - sam3-hf-cache:/root/.cache/huggingface
+      - sam3-torch-cache:/root/.cache/torch
+      # Mount for uploads and outputs (optional: for persistence)
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+      # Hugging Face token for downloading model weights
+      - HF_TOKEN=${HF_TOKEN}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Restart policy
+    restart: unless-stopped
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    # Shared memory size (important for PyTorch DataLoader)
+    shm_size: '8gb'
+    # Enable interactive mode for debugging (optional)
+    stdin_open: true
+    tty: true
+
+  # SAM3-CVAT Integration API Service
+  sam3-cvat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sam3-cvat-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount cache directories for model weights (shared with sam3 service)
+      - sam3-hf-cache:/root/.cache/huggingface
+      - sam3-torch-cache:/root/.cache/torch
+      # Mount for outputs
+      - ./outputs:/app/outputs
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      # Hugging Face token for downloading model weights
+      - HF_TOKEN=${HF_TOKEN}
+      # CVAT configuration
+      - CVAT_SERVER_URL=${CVAT_SERVER_URL:-http://192.168.50.15:8080}
+      - CVAT_USERNAME=${CVAT_USERNAME:-david}
+      - CVAT_PASSWORD=${CVAT_PASSWORD:-a123321a}
+      # SAM3 configuration
+      - CONFIDENCE_THRESHOLD=${CONFIDENCE_THRESHOLD:-0.5}
+      # API configuration
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Restart policy
+    restart: unless-stopped
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    # Shared memory size (important for PyTorch DataLoader)
+    shm_size: '8gb'
+    # Enable interactive mode for debugging
+    stdin_open: true
+    tty: true
+    # Override default command to run FastAPI
+    command: ["python3", "cvat_api.py"]
+
+  # SAM3-CVAT Gradio Web Interface
+  sam3-cvat-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sam3-cvat-gradio
+    ports:
+      - "7861:7861"
+    volumes:
+      # Mount cache directories for model weights (shared)
+      - sam3-hf-cache:/root/.cache/huggingface
+      - sam3-torch-cache:/root/.cache/torch
+      # Mount for outputs
+      - ./outputs:/app/outputs
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      # Hugging Face token for downloading model weights
+      - HF_TOKEN=${HF_TOKEN}
+      # CVAT configuration
+      - CVAT_SERVER_URL=${CVAT_SERVER_URL:-http://192.168.50.15:8080}
+      - CVAT_USERNAME=${CVAT_USERNAME:-david}
+      - CVAT_PASSWORD=${CVAT_PASSWORD:-a123321a}
+      # Gradio configuration
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7861
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Restart policy
+    restart: unless-stopped
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7861/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    # Shared memory size (important for PyTorch DataLoader)
+    shm_size: '8gb'
+    # Enable interactive mode for debugging
+    stdin_open: true
+    tty: true
+    # Override default command to run CVAT Gradio
+    command: ["python3", "cvat_gradio.py"]
+
+volumes:
+  sam3-hf-cache:
+  sam3-torch-cache:
