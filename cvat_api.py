@@ -45,7 +45,7 @@ def get_service() -> CVATSam3Service:
     global _service
     if _service is None:
         config = get_cvat_config()
-        threshold = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
+        threshold = float(os.getenv("CONFIDENCE_THRESHOLD", "0.6"))
         _service = CVATSam3Service(config, confidence_threshold=threshold)
     return _service
 

@@ -41,12 +41,71 @@ class JobProgress:
     processed_frames: int = 0
     total_frames: int = 0
     created_tasks: List[Dict] = field(default_factory=list)
+    # For ETA calculation
+    start_timestamp: float = 0.0  # Unix timestamp when processing started
+
+    # Streaming mode progress
+    batches_queued: int = 0      # Batches waiting to upload
+    batches_uploaded: int = 0    # Batches successfully uploaded
+    images_uploaded: int = 0     # Total images uploaded
+    upload_errors: int = 0       # Upload error count
+    current_phase: str = "scanning"  # "scanning", "uploading", "completed"
 
     @property
     def percentage(self) -> float:
         if self.total_frames == 0:
             return 0.0
         return (self.processed_frames / self.total_frames) * 100
+
+    @property
+    def upload_percentage(self) -> float:
+        """Upload progress percentage."""
+        if self.detected_count == 0:
+            return 0.0
+        return (self.images_uploaded / self.detected_count) * 100
+
+    def get_eta_seconds(self) -> Optional[float]:
+        """Calculate estimated time remaining in seconds."""
+        if self.processed_frames == 0 or self.start_timestamp == 0:
+            return None
+        if self.processed_frames >= self.total_frames:
+            return 0.0
+
+        elapsed = time.time() - self.start_timestamp
+        if elapsed <= 0:
+            return None
+
+        frames_per_second = self.processed_frames / elapsed
+        remaining_frames = self.total_frames - self.processed_frames
+        return remaining_frames / frames_per_second if frames_per_second > 0 else None
+
+    def get_eta_formatted(self) -> str:
+        """Get formatted ETA string."""
+        eta_seconds = self.get_eta_seconds()
+        if eta_seconds is None:
+            return "計算中..."
+        if eta_seconds == 0:
+            return "即將完成"
+
+        hours = int(eta_seconds // 3600)
+        minutes = int((eta_seconds % 3600) // 60)
+        seconds = int(eta_seconds % 60)
+
+        if hours > 0:
+            return f"{hours} 小時 {minutes} 分鐘"
+        elif minutes > 0:
+            return f"{minutes} 分鐘 {seconds} 秒"
+        else:
+            return f"{seconds} 秒"
+
+    def get_processing_speed(self) -> Optional[float]:
+        """Get frames per second processing speed."""
+        if self.processed_frames == 0 or self.start_timestamp == 0:
+            return None
+        elapsed = time.time() - self.start_timestamp
+        if elapsed <= 0:
+            return None
+        return self.processed_frames / elapsed
 
 
 @dataclass
@@ -65,7 +124,7 @@ class BatchJob:
     target_project_name: str = ""
     prompt: str = ""
     label_name: str = ""
-    confidence_threshold: float = 0.5
+    confidence_threshold: float = 0.6
     images_per_task: int = 500
     train_ratio: float = 70
     test_ratio: float = 20
@@ -73,6 +132,10 @@ class BatchJob:
     merge_regions: bool = False
     merge_kernel_size: int = 15
     merge_method: str = "closing"
+
+    # Server URLs
+    source_server_url: str = ""
+    target_server_url: str = ""
 
     # Progress tracking
     progress: JobProgress = field(default_factory=JobProgress)
@@ -112,6 +175,8 @@ class BatchJob:
             "merge_regions": self.merge_regions,
             "merge_kernel_size": self.merge_kernel_size,
             "merge_method": self.merge_method,
+            "source_server_url": self.source_server_url,
+            "target_server_url": self.target_server_url,
             "progress": {
                 "current_step": self.progress.current_step,
                 "total_steps": self.progress.total_steps,
@@ -123,6 +188,12 @@ class BatchJob:
                 "total_frames": self.progress.total_frames,
                 "percentage": self.progress.percentage,
                 "created_tasks": self.progress.created_tasks,
+                "start_timestamp": self.progress.start_timestamp,
+                "batches_queued": self.progress.batches_queued,
+                "batches_uploaded": self.progress.batches_uploaded,
+                "images_uploaded": self.progress.images_uploaded,
+                "upload_errors": self.progress.upload_errors,
+                "current_phase": self.progress.current_phase,
             },
             "error_message": self.error_message,
             "result_summary": self.result_summary,
@@ -195,7 +266,7 @@ class BatchJobManager:
         job.target_project_name = data.get("target_project_name", "")
         job.prompt = data.get("prompt", "")
         job.label_name = data.get("label_name", "")
-        job.confidence_threshold = data.get("confidence_threshold", 0.5)
+        job.confidence_threshold = data.get("confidence_threshold", 0.6)
         job.images_per_task = data.get("images_per_task", 500)
         job.train_ratio = data.get("train_ratio", 70)
         job.test_ratio = data.get("test_ratio", 20)
@@ -203,6 +274,8 @@ class BatchJobManager:
         job.merge_regions = data.get("merge_regions", False)
         job.merge_kernel_size = data.get("merge_kernel_size", 15)
         job.merge_method = data.get("merge_method", "closing")
+        job.source_server_url = data.get("source_server_url", "")
+        job.target_server_url = data.get("target_server_url", "")
         job.error_message = data.get("error_message", "")
         job.result_summary = data.get("result_summary", "")
         job.log_messages = data.get("log_messages", [])
@@ -218,6 +291,12 @@ class BatchJobManager:
             processed_frames=progress_data.get("processed_frames", 0),
             total_frames=progress_data.get("total_frames", 0),
             created_tasks=progress_data.get("created_tasks", []),
+            start_timestamp=progress_data.get("start_timestamp", 0.0),
+            batches_queued=progress_data.get("batches_queued", 0),
+            batches_uploaded=progress_data.get("batches_uploaded", 0),
+            images_uploaded=progress_data.get("images_uploaded", 0),
+            upload_errors=progress_data.get("upload_errors", 0),
+            current_phase=progress_data.get("current_phase", "scanning"),
         )
 
         return job
@@ -230,7 +309,7 @@ class BatchJobManager:
         target_project_name: str,
         prompt: str,
         label_name: str,
-        confidence_threshold: float = 0.5,
+        confidence_threshold: float = 0.6,
         images_per_task: int = 500,
         train_ratio: float = 70,
         test_ratio: float = 20,
@@ -238,6 +317,8 @@ class BatchJobManager:
         merge_regions: bool = False,
         merge_kernel_size: int = 15,
         merge_method: str = "closing",
+        source_server_url: str = "",
+        target_server_url: str = "",
     ) -> BatchJob:
         """Create a new batch job."""
         job_id = str(uuid.uuid4())[:8]
@@ -260,6 +341,8 @@ class BatchJobManager:
             merge_regions=merge_regions,
             merge_kernel_size=merge_kernel_size,
             merge_method=merge_method,
+            source_server_url=source_server_url,
+            target_server_url=target_server_url,
         )
 
         with self.lock:

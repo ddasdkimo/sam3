@@ -20,27 +20,37 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global instances
-_cvat_client: Optional[CVATClient] = None
+_cvat_clients: Dict[str, CVATClient] = {}
 _sam3_model = None
 _sam3_processor = None
 
 # Cache for projects, tasks, frames
-_projects_cache: List[Dict] = []
+_projects_cache: Dict[str, List[Dict]] = {}  # server_url -> projects
 _tasks_cache: Dict[int, List[Dict]] = {}
 _frames_cache: Dict[int, Dict] = {}
 
+# Available CVAT servers
+CVAT_SERVERS = [
+    ("192.168.50.15", "http://192.168.50.15:8080"),
+    ("192.168.53.35", "http://192.168.53.35:8080"),
+]
 
-def get_cvat_client() -> CVATClient:
-    """Get or create CVAT client."""
-    global _cvat_client
-    if _cvat_client is None:
+
+def get_cvat_client(server_url: str = None) -> CVATClient:
+    """Get or create CVAT client for a specific server."""
+    global _cvat_clients
+
+    if server_url is None:
+        server_url = os.getenv("CVAT_SERVER_URL", "http://192.168.50.15:8080")
+
+    if server_url not in _cvat_clients:
         config = CVATConfig(
-            server_url=os.getenv("CVAT_SERVER_URL", "http://192.168.50.15:8080"),
+            server_url=server_url,
             username=os.getenv("CVAT_USERNAME", "david"),
             password=os.getenv("CVAT_PASSWORD", "a123321a"),
         )
-        _cvat_client = CVATClient(config)
-    return _cvat_client
+        _cvat_clients[server_url] = CVATClient(config)
+    return _cvat_clients[server_url]
 
 
 def get_sam3_model():
@@ -62,26 +72,28 @@ def get_sam3_model():
     return _sam3_model, _sam3_processor
 
 
-def load_projects() -> List[Tuple[str, int]]:
+def load_projects(server_url: str = None) -> List[Tuple[str, int]]:
     """Load all projects from CVAT."""
     global _projects_cache
     try:
-        client = get_cvat_client()
-        _projects_cache = client.get_projects()
-        choices = [(f"{p['name']} (ID: {p['id']})", p['id']) for p in _projects_cache]
+        client = get_cvat_client(server_url)
+        projects = client.get_projects()
+        if server_url:
+            _projects_cache[server_url] = projects
+        choices = [(f"{p['name']} (ID: {p['id']})", p['id']) for p in projects]
         return choices
     except Exception as e:
-        logger.error(f"Error loading projects: {e}")
+        logger.error(f"Error loading projects from {server_url}: {e}")
         return []
 
 
-def load_tasks(project_id: int) -> List[Tuple[str, int]]:
+def load_tasks(project_id: int, server_url: str = None) -> List[Tuple[str, int]]:
     """Load tasks for a project."""
     global _tasks_cache
     if not project_id:
         return []
     try:
-        client = get_cvat_client()
+        client = get_cvat_client(server_url)
         tasks = client.get_project_tasks(project_id)
         _tasks_cache[project_id] = tasks
         choices = [(f"{t['name']} ({t.get('size', 0)} frames)", t['id']) for t in tasks]
@@ -252,6 +264,108 @@ def detect_objects(
         return np.array(image), {"error": str(e)}
 
 
+def detect_objects_batch(
+    images: List[Image.Image],
+    prompt: str,
+    confidence_threshold: float
+) -> List[Dict]:
+    """
+    Detect objects in multiple images using SAM3 batch inference.
+    Returns a list of detection results, one per image.
+    """
+    if not images or not prompt:
+        return [{"detected": False, "error": "No images or prompt"}] * len(images) if images else []
+
+    try:
+        model, processor = get_sam3_model()
+        processor.confidence_threshold = confidence_threshold
+
+        # Batch image encoding (GPU efficient)
+        state = processor.set_image_batch(images)
+
+        # Text encoding (done once for all images)
+        text_outputs = model.backbone.forward_text([prompt], device=processor.device)
+        state["backbone_out"].update(text_outputs)
+
+        # Process each image with the shared text encoding
+        results = []
+        batch_size = len(images)
+
+        # Get backbone outputs
+        backbone_out = state["backbone_out"]
+
+        for i in range(batch_size):
+            try:
+                # Create single-image state from batch
+                single_state = {
+                    "original_height": state["original_heights"][i],
+                    "original_width": state["original_widths"][i],
+                    "backbone_out": {},
+                    "geometric_prompt": model._get_dummy_prompt()
+                }
+
+                # Extract single image features from batch
+                for key, value in backbone_out.items():
+                    if isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
+                        single_state["backbone_out"][key] = value[i:i+1]
+                    elif isinstance(value, dict):
+                        single_state["backbone_out"][key] = {}
+                        for k, v in value.items():
+                            if isinstance(v, torch.Tensor) and len(v.shape) > 0 and v.shape[0] == batch_size:
+                                single_state["backbone_out"][key][k] = v[i:i+1]
+                            elif isinstance(v, list) and len(v) == batch_size:
+                                single_state["backbone_out"][key][k] = [v[i]]
+                            else:
+                                single_state["backbone_out"][key][k] = v
+                    elif isinstance(value, list) and len(value) == batch_size:
+                        single_state["backbone_out"][key] = [value[i]]
+                    else:
+                        single_state["backbone_out"][key] = value
+
+                # Run grounding for this image
+                output = processor._forward_grounding(single_state)
+
+                masks = output.get("masks", None)
+                scores = output.get("scores", None)
+
+                if masks is None or len(masks) == 0:
+                    results.append({
+                        "detected": False,
+                        "num_objects": 0,
+                        "masks": None,
+                        "scores": None
+                    })
+                else:
+                    if isinstance(masks, torch.Tensor):
+                        masks = masks.cpu().numpy()
+                    if isinstance(scores, torch.Tensor):
+                        scores = scores.cpu().numpy()
+                    if masks.ndim == 4:
+                        masks = masks.squeeze(1)
+
+                    results.append({
+                        "detected": True,
+                        "num_objects": len(masks),
+                        "masks": masks,
+                        "scores": scores
+                    })
+
+            except Exception as e:
+                logger.warning(f"Batch item {i} detection error: {e}")
+                results.append({
+                    "detected": False,
+                    "error": str(e),
+                    "masks": None,
+                    "scores": None
+                })
+
+        return results
+
+    except Exception as e:
+        logger.error(f"Batch detection error: {e}")
+        return [{"detected": False, "error": str(e)}] * len(images)
+
+
 # Store last detection result for CVAT upload
 _last_detection = {
     "image": None,
@@ -315,18 +429,18 @@ def detect_and_store(task_id, frame_number, prompt, confidence):
     return result_image, result_text, gr.update(interactive=can_upload)
 
 
-def load_project_labels(project_id):
+def load_project_labels(project_id, server_url: str = None):
     """Load labels for a project."""
     if not project_id:
         return gr.update(choices=[], value=None)
 
     try:
-        client = get_cvat_client()
+        client = get_cvat_client(server_url)
         labels = client.get_labels(project_id=project_id)
         choices = [(lbl["name"], lbl["name"]) for lbl in labels]
         return gr.update(choices=choices, value=choices[0][0] if choices else None)
     except Exception as e:
-        logger.error(f"Error loading labels: {e}")
+        logger.error(f"Error loading labels from {server_url}: {e}")
         return gr.update(choices=[], value=None)
 
 
@@ -445,12 +559,15 @@ def batch_scan_project(
     merge_regions: bool = False,
     merge_kernel_size: int = 15,
     merge_method: str = "closing",
+    source_server_url: str = None,
+    target_server_url: str = None,
     progress=gr.Progress()
 ):
     """
     Scan all tasks/frames in a project, detect objects, and transfer to target project.
     Creates new tasks with max images_per_task images each.
     Splits into Train/Test/Validation sets based on ratios.
+    Supports different source and target CVAT servers.
     """
     global _batch_stop_flag
     _batch_stop_flag = False
@@ -473,11 +590,12 @@ def batch_scan_project(
 
     try:
         import time
-        client = get_cvat_client()
+        source_client = get_cvat_client(source_server_url)
+        target_client = get_cvat_client(target_server_url)
 
         # Get source project info
-        source_project = client.get_project(source_project_id)
-        source_tasks = client.get_project_tasks(source_project_id)
+        source_project = source_client.get_project(source_project_id)
+        source_tasks = source_client.get_project_tasks(source_project_id)
 
         # Calculate total frames
         total_frames = sum(t.get("size", 0) for t in source_tasks)
@@ -511,8 +629,8 @@ def batch_scan_project(
                 progress(progress_pct, desc=f"掃描 {task_name} - Frame {frame_num+1}/{task_size}")
 
                 try:
-                    # Download frame
-                    image = client.get_task_frame(task_id, frame_num, "compressed")
+                    # Download frame from source server
+                    image = source_client.get_task_frame(task_id, frame_num, "compressed")
 
                     # Detect objects
                     _, detection_info = detect_objects(image, prompt, confidence_threshold)
@@ -659,20 +777,20 @@ def batch_scan_project(
                             if new_task_id is not None:
                                 try:
                                     logger.info(f"Deleting failed task {new_task_id}")
-                                    delete_url = f"{client.base_url}/api/tasks/{new_task_id}"
-                                    client.session.delete(delete_url, headers=client._get_headers(), timeout=30)
+                                    delete_url = f"{target_client.base_url}/api/tasks/{new_task_id}"
+                                    target_client.session.delete(delete_url, headers=target_client._get_headers(), timeout=30)
                                 except Exception as del_err:
                                     logger.warning(f"Failed to delete task {new_task_id}: {del_err}")
 
-                            # Create new task
+                            # Create new task on target server
                             retry_task_name = task_name if retry == 0 else f"{task_name}_retry{retry}"
-                            new_task = client.create_task(retry_task_name, target_project_id)
+                            new_task = target_client.create_task(retry_task_name, target_project_id)
                             new_task_id = new_task["id"]
                             logger.info(f"Created task {new_task_id}: {retry_task_name}")
 
                             # Upload ZIP archive (single file upload is more reliable)
-                            url = f"{client.base_url}/api/tasks/{new_task_id}/data"
-                            headers = {"Authorization": f"Token {client.token}"}
+                            url = f"{target_client.base_url}/api/tasks/{new_task_id}/data"
+                            headers = {"Authorization": f"Token {target_client.token}"}
 
                             zip_filename = f"{task_name}.zip"
                             multipart_files = [
@@ -684,7 +802,7 @@ def batch_scan_project(
                             current_timeout = base_timeout * (retry + 1)  # 600, 1200, 1800 seconds
                             logger.info(f"Upload attempt {retry + 1}/{max_retries} with timeout {current_timeout}s, ZIP size: {zip_size_mb:.2f} MB")
 
-                            response = client.session.post(
+                            response = target_client.session.post(
                                 url, headers=headers, files=multipart_files,
                                 data=data, timeout=current_timeout
                             )
@@ -702,8 +820,8 @@ def batch_scan_project(
                                 # Clean up failed task on final failure
                                 if new_task_id is not None:
                                     try:
-                                        delete_url = f"{client.base_url}/api/tasks/{new_task_id}"
-                                        client.session.delete(delete_url, headers=client._get_headers(), timeout=30)
+                                        delete_url = f"{target_client.base_url}/api/tasks/{new_task_id}"
+                                        target_client.session.delete(delete_url, headers=target_client._get_headers(), timeout=30)
                                         logger.info(f"Cleaned up failed task {new_task_id}")
                                     except:
                                         pass
@@ -714,13 +832,13 @@ def batch_scan_project(
 
                     # Wait for task to be ready (up to 5 minutes)
                     for _ in range(300):
-                        task_info = client.get_task(new_task_id)
+                        task_info = target_client.get_task(new_task_id)
                         if task_info.get("size", 0) >= len(chunk):
                             break
                         time.sleep(1)
 
                     # Get frame metadata to build filename -> frame_number mapping
-                    meta = client.get_task_data_meta(new_task_id)
+                    meta = target_client.get_task_data_meta(new_task_id)
                     frames_info = meta.get("frames", [])
 
                     # Build filename to frame number mapping
@@ -740,8 +858,8 @@ def batch_scan_project(
                     if frames_info:
                         logger.info(f"Sample frame names: {[f.get('name', '') for f in frames_info[:3]]}")
 
-                    # Get label_id
-                    labels = client.get_labels(project_id=target_project_id)
+                    # Get label_id from target server
+                    labels = target_client.get_labels(project_id=target_project_id)
                     label_id = None
                     for label in labels:
                         if label.get("name") == label_name:
@@ -776,7 +894,7 @@ def batch_scan_project(
                             masks = masks.squeeze(1)
 
                         for mask in masks:
-                            polygons = client.mask_to_polygon(
+                            polygons = target_client.mask_to_polygon(
                                 mask,
                                 merge_regions=merge_regions,
                                 merge_kernel_size=merge_kernel_size,
@@ -807,7 +925,7 @@ def batch_scan_project(
                     else:
                         logger.info(f"Task {new_task_id}: All {len(file_metadata)} frame mappings successful")
 
-                    # Upload annotations
+                    # Upload annotations to target server
                     if shapes:
                         annotations = {
                             "version": 0,
@@ -815,8 +933,8 @@ def batch_scan_project(
                             "shapes": shapes,
                             "tracks": []
                         }
-                        url = f"{client.base_url}/api/tasks/{new_task_id}/annotations"
-                        response = client.session.put(url, headers=client._get_headers(), json=annotations, timeout=60)
+                        url = f"{target_client.base_url}/api/tasks/{new_task_id}/annotations"
+                        response = target_client.session.put(url, headers=target_client._get_headers(), json=annotations, timeout=60)
                         response.raise_for_status()
                         logger.info(f"Uploaded {len(shapes)} annotations to task {new_task_id}")
 
@@ -888,129 +1006,62 @@ def stop_batch_scan():
 
 def run_batch_job_background(job: BatchJob, cancel_flag):
     """
-    Execute batch scan in background thread.
-    This function runs independently of the web UI.
+    Execute batch scan in background thread with streaming upload.
+    Uses producer-consumer pattern for memory efficiency.
+    Scanning continues while uploads happen in parallel.
     """
     import io
     import os
+    import queue
     import random
+    import threading
     import time
     import zipfile
 
-    try:
-        client = get_cvat_client()
+    # Upload queue and state
+    upload_queue = queue.Queue(maxsize=3)  # Buffer up to 3 batches
+    upload_errors = []
+    upload_done = threading.Event()
+    total_annotations = [0]  # Use list for mutable reference in thread
 
-        # Get source project info
-        source_project = client.get_project(job.source_project_id)
-        source_tasks = client.get_project_tasks(job.source_project_id)
+    def upload_worker():
+        """Background thread that uploads batches to CVAT."""
+        target_client = get_cvat_client(job.target_server_url if job.target_server_url else None)
 
-        # Calculate total frames
-        total_frames = sum(t.get("size", 0) for t in source_tasks)
-        total_tasks = len(source_tasks)
-
-        job.progress.total_frames = total_frames
-        job.progress.total_steps = total_tasks
-        job.add_log(f"來源專案: {source_project['name']}, 任務數: {total_tasks}, 總幀數: {total_frames}")
-
-        # Collect detected images
-        detected_images = []
-        processed_frames = 0
-
-        for task_idx, task in enumerate(source_tasks):
-            if cancel_flag.is_set():
-                job.add_log("收到取消請求，停止掃描")
-                return
-
-            task_id = task["id"]
-            task_name = task["name"]
-            task_size = task.get("size", 0)
-
-            job.progress.current_step = task_idx + 1
-            job.progress.current_task = task_name
-            job.progress.task_frames = task_size
-            job.add_log(f"掃描任務 {task_idx + 1}/{total_tasks}: {task_name}")
-
-            for frame_num in range(task_size):
-                if cancel_flag.is_set():
-                    return
-
-                processed_frames += 1
-                job.progress.processed_frames = processed_frames
-                job.progress.current_frame = frame_num + 1
-
-                try:
-                    image = client.get_task_frame(task_id, frame_num, "compressed")
-                    _, detection_info = detect_objects(image, job.prompt, job.confidence_threshold)
-
-                    if detection_info.get("detected", False) and detection_info.get("masks") is not None:
-                        job.progress.detected_count += 1
-                        detected_images.append({
-                            "image": image,
-                            "masks": detection_info["masks"],
-                            "scores": detection_info.get("scores"),
-                            "source_task": task_name,
-                            "source_frame": frame_num
-                        })
-
-                except Exception as e:
-                    logger.warning(f"Error processing {task_name} frame {frame_num}: {e}")
-                    continue
-
-        job.add_log(f"掃描完成: 處理 {processed_frames} 幀, 檢測到 {len(detected_images)} 張包含物件的圖片")
-
-        if not detected_images:
-            job.result_summary = f"掃描完成，未找到包含 '{job.prompt}' 的圖片"
-            return
-
-        # Shuffle and split into Train/Test/Validation
-        random.shuffle(detected_images)
-        total_images = len(detected_images)
-
-        ratio_sum = job.train_ratio + job.test_ratio + job.val_ratio
-        if ratio_sum <= 0:
-            ratio_sum = 100
-            job.train_ratio, job.test_ratio, job.val_ratio = 70, 20, 10
-
-        train_count = int(total_images * job.train_ratio / ratio_sum)
-        test_count = int(total_images * job.test_ratio / ratio_sum)
-        val_count = total_images - train_count - test_count
-
-        dataset_splits = {}
-        if job.train_ratio > 0 and train_count > 0:
-            dataset_splits["train"] = detected_images[:train_count]
-        if job.test_ratio > 0 and test_count > 0:
-            dataset_splits["test"] = detected_images[train_count:train_count + test_count]
-        if job.val_ratio > 0 and val_count > 0:
-            dataset_splits["val"] = detected_images[train_count + test_count:]
-
-        job.add_log(f"資料集分割: Train={train_count}, Test={test_count}, Val={val_count}")
-
-        # Create tasks in target project
-        created_tasks = []
-        total_annotations = 0
-
-        for split_name, split_images in dataset_splits.items():
-            if cancel_flag.is_set():
+        # Get label_id once
+        labels = target_client.get_labels(project_id=job.target_project_id)
+        label_id = None
+        for label in labels:
+            if label.get("name") == job.label_name:
+                label_id = label.get("id")
                 break
 
-            chunks = [split_images[i:i + job.images_per_task]
-                      for i in range(0, len(split_images), job.images_per_task)]
+        if label_id is None:
+            upload_errors.append(f"Label '{job.label_name}' not found")
+            return
 
-            for chunk_idx, chunk in enumerate(chunks):
-                if cancel_flag.is_set():
+        while True:
+            try:
+                # Get batch from queue (with timeout to check for completion)
+                try:
+                    batch = upload_queue.get(timeout=1.0)
+                except queue.Empty:
+                    if upload_done.is_set() and upload_queue.empty():
+                        break
+                    continue
+
+                if batch is None:  # Poison pill
                     break
 
-                task_num = chunk_idx + 1
-                source_project_name = source_project['name'].replace(' ', '_')[:25]
-                task_name = f"{source_project_name}_{job.prompt}_{split_name}_{task_num:03d}"
-
-                job.add_log(f"建立 {split_name} 任務 {task_num}/{len(chunks)}: {task_name}")
+                task_name = batch["task_name"]
+                split_name = batch["split_name"]
+                images_data = batch["images_data"]
 
                 try:
                     # Prepare ZIP archive
                     files = []
                     file_metadata = []
-                    for img_idx, item in enumerate(chunk):
+                    for img_idx, item in enumerate(images_data):
                         img_buffer = io.BytesIO()
                         item["image"].save(img_buffer, format='JPEG', quality=95)
                         img_bytes = img_buffer.getvalue()
@@ -1018,9 +1069,11 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                         files.append((filename, img_bytes))
                         file_metadata.append({
                             "filename": filename,
-                            "item": item,
+                            "masks": item["masks"],
                             "expected_frame": img_idx
                         })
+                        # Clear image from memory immediately after encoding
+                        item["image"] = None
 
                     zip_buffer = io.BytesIO()
                     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -1028,6 +1081,9 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                             zf.writestr(filename, img_bytes)
                     zip_buffer.seek(0)
                     zip_bytes = zip_buffer.getvalue()
+
+                    # Clear files list to free memory
+                    files.clear()
 
                     # Create task with retry
                     max_retries = 3
@@ -1038,23 +1094,23 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                         try:
                             if new_task_id is not None:
                                 try:
-                                    delete_url = f"{client.base_url}/api/tasks/{new_task_id}"
-                                    client.session.delete(delete_url, headers=client._get_headers(), timeout=30)
+                                    delete_url = f"{target_client.base_url}/api/tasks/{new_task_id}"
+                                    target_client.session.delete(delete_url, headers=target_client._get_headers(), timeout=30)
                                 except:
                                     pass
 
                             retry_task_name = task_name if retry == 0 else f"{task_name}_retry{retry}"
-                            new_task = client.create_task(retry_task_name, job.target_project_id)
+                            new_task = target_client.create_task(retry_task_name, job.target_project_id)
                             new_task_id = new_task["id"]
 
-                            url = f"{client.base_url}/api/tasks/{new_task_id}/data"
-                            headers = {"Authorization": f"Token {client.token}"}
+                            url = f"{target_client.base_url}/api/tasks/{new_task_id}/data"
+                            headers = {"Authorization": f"Token {target_client.token}"}
                             zip_filename = f"{task_name}.zip"
                             multipart_files = [('client_files[0]', (zip_filename, zip_bytes, 'application/zip'))]
                             data = {"image_quality": 70}
 
                             current_timeout = base_timeout * (retry + 1)
-                            response = client.session.post(
+                            response = target_client.session.post(
                                 url, headers=headers, files=multipart_files,
                                 data=data, timeout=current_timeout
                             )
@@ -1067,15 +1123,18 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                             else:
                                 raise upload_error
 
+                    # Clear zip bytes
+                    zip_bytes = None
+
                     # Wait for task to be ready
                     for _ in range(300):
-                        task_info = client.get_task(new_task_id)
-                        if task_info.get("size", 0) >= len(chunk):
+                        task_info = target_client.get_task(new_task_id)
+                        if task_info.get("size", 0) >= len(images_data):
                             break
                         time.sleep(1)
 
-                    # Get frame metadata and create annotations
-                    meta = client.get_task_data_meta(new_task_id)
+                    # Get frame metadata
+                    meta = target_client.get_task_data_meta(new_task_id)
                     frames_info = meta.get("frames", [])
 
                     filename_to_frame = {}
@@ -1086,36 +1145,24 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                         if basename != fname:
                             filename_to_frame[basename] = frame_num
 
-                    # Get label_id
-                    labels = client.get_labels(project_id=job.target_project_id)
-                    label_id = None
-                    for label in labels:
-                        if label.get("name") == job.label_name:
-                            label_id = label.get("id")
-                            break
-
-                    if label_id is None:
-                        raise ValueError(f"Label '{job.label_name}' not found")
-
                     # Create annotations
                     shapes = []
                     group_id_counter = 1
 
                     for meta_item in file_metadata:
                         filename = meta_item["filename"]
-                        item = meta_item["item"]
                         expected_frame = meta_item["expected_frame"]
+                        masks = meta_item["masks"]
 
                         frame_num = filename_to_frame.get(filename, expected_frame)
 
-                        masks = item["masks"]
                         if hasattr(masks, 'cpu'):
                             masks = masks.cpu().numpy()
                         if masks.ndim == 4:
                             masks = masks.squeeze(1)
 
                         for mask in masks:
-                            polygons = client.mask_to_polygon(
+                            polygons = target_client.mask_to_polygon(
                                 mask,
                                 merge_regions=job.merge_regions,
                                 merge_kernel_size=job.merge_kernel_size,
@@ -1138,6 +1185,9 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                                         "attributes": []
                                     })
 
+                    # Clear file_metadata to free memory
+                    file_metadata.clear()
+
                     # Upload annotations
                     if shapes:
                         annotations = {
@@ -1146,31 +1196,311 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                             "shapes": shapes,
                             "tracks": []
                         }
-                        url = f"{client.base_url}/api/tasks/{new_task_id}/annotations"
-                        response = client.session.put(url, headers=client._get_headers(), json=annotations, timeout=60)
+                        url = f"{target_client.base_url}/api/tasks/{new_task_id}/annotations"
+                        response = target_client.session.put(
+                            url, headers=target_client._get_headers(),
+                            json=annotations, timeout=60
+                        )
                         response.raise_for_status()
 
-                    total_annotations += len(shapes)
+                    total_annotations[0] += len(shapes)
+
                     task_info = {
                         "task_id": new_task_id,
                         "task_name": task_name,
                         "split": split_name,
-                        "images": len(chunk),
+                        "images": len(images_data),
                         "annotations": len(shapes)
                     }
-                    created_tasks.append(task_info)
                     job.progress.created_tasks.append(task_info)
-                    job.add_log(f"✓ 建立任務 {task_name}: {len(chunk)} 張圖片, {len(shapes)} 個標註")
+                    job.progress.batches_uploaded += 1
+                    job.progress.images_uploaded += len(images_data)
+                    job.add_log(f"✓ 上傳完成 {task_name}: {len(images_data)} 張, {len(shapes)} 標註")
 
                 except Exception as e:
-                    job.add_log(f"✗ 建立任務失敗 {task_name}: {e}")
-                    logger.error(f"Error creating task {task_name}: {e}")
+                    job.progress.upload_errors += 1
+                    job.add_log(f"✗ 上傳失敗 {task_name}: {e}")
+                    logger.error(f"Upload error {task_name}: {e}")
+                    upload_errors.append(str(e))
+
+                finally:
+                    upload_queue.task_done()
+                    # Clear images_data to free memory
+                    images_data.clear()
+
+            except Exception as e:
+                logger.error(f"Upload worker error: {e}")
+
+    try:
+        # Get clients for source server
+        source_client = get_cvat_client(job.source_server_url if job.source_server_url else None)
+
+        # Get source project info
+        source_project = source_client.get_project(job.source_project_id)
+        source_tasks = source_client.get_project_tasks(job.source_project_id)
+
+        # Calculate total frames
+        total_frames = sum(t.get("size", 0) for t in source_tasks)
+        total_tasks = len(source_tasks)
+
+        job.progress.total_frames = total_frames
+        job.progress.total_steps = total_tasks
+        job.progress.start_timestamp = time.time()
+        job.progress.current_phase = "scanning"
+        job.add_log(f"來源專案: {source_project['name']}, 任務數: {total_tasks}, 總幀數: {total_frames}")
+        job.add_log(f"🚀 串流模式: 每 {job.images_per_task} 張圖片自動上傳，平行處理")
+
+        # ============ PREFETCH SETUP ============
+        # Build list of all frames to process
+        all_frames = []
+        for task in source_tasks:
+            task_id = task["id"]
+            task_name = task["name"]
+            task_size = task.get("size", 0)
+            for frame_num in range(task_size):
+                all_frames.append((task_id, task_name, frame_num))
+
+        # Prefetch queue and control
+        PREFETCH_BUFFER_SIZE = 24  # Prefetch 3 batches ahead (8 images per batch)
+        prefetch_queue = queue.Queue(maxsize=PREFETCH_BUFFER_SIZE)
+        prefetch_stop = threading.Event()
+        prefetch_errors = [0]  # Track download errors
+
+        def prefetch_worker():
+            """Background thread that downloads images ahead of time."""
+            # Create a separate client for prefetch thread
+            prefetch_client = get_cvat_client(job.source_server_url if job.source_server_url else None)
+
+            for task_id, task_name, frame_num in all_frames:
+                if prefetch_stop.is_set() or cancel_flag.is_set():
+                    break
+
+                try:
+                    image = prefetch_client.get_task_frame(task_id, frame_num, "compressed")
+                    # Put in queue, block if full (backpressure)
+                    while not prefetch_stop.is_set() and not cancel_flag.is_set():
+                        try:
+                            prefetch_queue.put((task_id, task_name, frame_num, image, None), timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+                except Exception as e:
+                    prefetch_errors[0] += 1
+                    # Put error marker
+                    try:
+                        prefetch_queue.put((task_id, task_name, frame_num, None, str(e)), timeout=1.0)
+                    except queue.Full:
+                        pass
+
+            # Signal end of prefetch
+            try:
+                prefetch_queue.put(None, timeout=5.0)  # Poison pill
+            except queue.Full:
+                pass
+
+        # Start prefetch thread
+        prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
+        prefetch_thread.start()
+        job.add_log(f"⚡ 預下載啟動: 緩衝 {PREFETCH_BUFFER_SIZE} 張圖片")
+        # ============ END PREFETCH SETUP ============
+
+        # Start upload worker thread
+        upload_thread = threading.Thread(target=upload_worker, daemon=True)
+        upload_thread.start()
+
+        # Calculate split ratios
+        ratio_sum = job.train_ratio + job.test_ratio + job.val_ratio
+        if ratio_sum <= 0:
+            ratio_sum = 100
+            job.train_ratio, job.test_ratio, job.val_ratio = 70, 20, 10
+
+        train_prob = job.train_ratio / ratio_sum
+        test_prob = job.test_ratio / ratio_sum
+        # val_prob is the remainder
+
+        # Buffers for each split (streaming mode)
+        split_buffers = {
+            "train": [],
+            "test": [],
+            "val": []
+        }
+        split_counters = {"train": 0, "test": 0, "val": 0}
+        source_project_name = source_project['name'].replace(' ', '_')[:25]
+
+        def flush_buffer(split_name, force=False):
+            """Flush buffer to upload queue when full or forced."""
+            buffer = split_buffers[split_name]
+            if len(buffer) == 0:
+                return
+
+            if len(buffer) >= job.images_per_task or force:
+                split_counters[split_name] += 1
+                task_name = f"{source_project_name}_{job.prompt}_{split_name}_{split_counters[split_name]:03d}"
+
+                batch = {
+                    "task_name": task_name,
+                    "split_name": split_name,
+                    "images_data": buffer.copy()
+                }
+
+                # Put in queue (may block if queue is full - that's the backpressure)
+                while not cancel_flag.is_set():
+                    try:
+                        upload_queue.put(batch, timeout=1.0)
+                        job.progress.batches_queued += 1
+                        job.add_log(f"📦 排隊上傳 {task_name}: {len(buffer)} 張 (佇列: {upload_queue.qsize()})")
+                        break
+                    except queue.Full:
+                        continue
+
+                # Clear buffer
+                split_buffers[split_name] = []
+
+        processed_frames = 0
+        current_task_name = ""
+        current_task_idx = 0
+        task_frame_counts = {task["name"]: task.get("size", 0) for task in source_tasks}
+        task_names_ordered = [task["name"] for task in source_tasks]
+
+        # ============ BATCH INFERENCE SETTINGS ============
+        INFERENCE_BATCH_SIZE = 8  # Process 8 images at once for GPU efficiency
+        batch_buffer = []  # Accumulate images for batch processing
+        job.add_log(f"🚀 批次推論模式: 每 {INFERENCE_BATCH_SIZE} 張圖片一次 GPU 處理")
+
+        def process_batch(batch_items):
+            """Process a batch of images with SAM3 batch inference."""
+            nonlocal processed_frames
+
+            if not batch_items:
+                return
+
+            # Extract images for batch inference
+            images = [item["image"] for item in batch_items]
+
+            # Run batch detection
+            batch_results = detect_objects_batch(images, job.prompt, job.confidence_threshold)
+
+            # Process results
+            for item, detection_info in zip(batch_items, batch_results):
+                image = item["image"]
+                task_name = item["task_name"]
+                frame_num = item["frame_num"]
+
+                if detection_info.get("detected", False) and detection_info.get("masks") is not None:
+                    job.progress.detected_count += 1
+
+                    # Assign to split using probability
+                    r = random.random()
+                    if r < train_prob:
+                        split = "train"
+                    elif r < train_prob + test_prob:
+                        split = "test"
+                    else:
+                        split = "val"
+
+                    split_buffers[split].append({
+                        "image": image,
+                        "masks": detection_info["masks"],
+                        "scores": detection_info.get("scores"),
+                        "source_task": task_name,
+                        "source_frame": frame_num
+                    })
+
+                    # Check if buffer is full
+                    if len(split_buffers[split]) >= job.images_per_task:
+                        flush_buffer(split)
+                else:
+                    # Release image memory if not detected
+                    del image
+
+        # ============ MAIN PROCESSING LOOP (with batch inference) ============
+        prefetch_done = False
+        while True:
+            if cancel_flag.is_set():
+                job.add_log("收到取消請求，停止掃描")
+                prefetch_stop.set()
+                break
+
+            # Accumulate images into batch
+            while len(batch_buffer) < INFERENCE_BATCH_SIZE:
+                try:
+                    item = prefetch_queue.get(timeout=0.1)
+                except queue.Empty:
+                    break
+
+                if item is None:  # Poison pill - prefetch done
+                    prefetch_done = True
+                    break
+
+                task_id, task_name, frame_num, image, error = item
+
+                # Update progress tracking
+                if task_name != current_task_name:
+                    current_task_name = task_name
+                    if task_name in task_names_ordered:
+                        current_task_idx = task_names_ordered.index(task_name) + 1
+                    job.progress.current_step = current_task_idx
+                    job.progress.current_task = task_name
+                    job.progress.task_frames = task_frame_counts.get(task_name, 0)
+                    job.add_log(f"掃描任務 {current_task_idx}/{total_tasks}: {task_name} (預載: {prefetch_queue.qsize()}, 批次: {len(batch_buffer)})")
+
+                processed_frames += 1
+                job.progress.processed_frames = processed_frames
+                job.progress.current_frame = frame_num + 1
+
+                # Handle download error
+                if image is None:
+                    logger.warning(f"Prefetch error {task_name} frame {frame_num}: {error}")
                     continue
 
+                batch_buffer.append({
+                    "image": image,
+                    "task_name": task_name,
+                    "frame_num": frame_num
+                })
+
+            # Process batch when full or when prefetch is done
+            if len(batch_buffer) >= INFERENCE_BATCH_SIZE or (prefetch_done and batch_buffer):
+                try:
+                    process_batch(batch_buffer)
+                except Exception as e:
+                    logger.warning(f"Batch processing error: {e}")
+                batch_buffer = []
+
+            # Exit when prefetch is done and batch is empty
+            if prefetch_done and not batch_buffer:
+                break
+
+        # Stop prefetch thread
+        prefetch_stop.set()
+        prefetch_thread.join(timeout=5.0)
+        if prefetch_errors[0] > 0:
+            job.add_log(f"⚠️ 預下載錯誤: {prefetch_errors[0]} 次")
+
+        # Flush remaining buffers
+        job.add_log("掃描完成，正在上傳剩餘資料...")
+        job.progress.current_phase = "uploading"
+
+        for split_name in ["train", "test", "val"]:
+            flush_buffer(split_name, force=True)
+
+        # Signal upload thread to finish
+        upload_done.set()
+
+        # Wait for all uploads to complete
+        job.add_log(f"等待上傳完成... (剩餘: {upload_queue.qsize()} 批次)")
+        upload_thread.join(timeout=3600)  # Wait up to 1 hour
+
+        job.progress.current_phase = "completed"
+
         # Generate summary
-        train_tasks = [t for t in created_tasks if t.get('split') == 'train']
-        test_tasks = [t for t in created_tasks if t.get('split') == 'test']
-        val_tasks = [t for t in created_tasks if t.get('split') == 'val']
+        train_count = sum(1 for t in job.progress.created_tasks if t.get('split') == 'train')
+        test_count = sum(1 for t in job.progress.created_tasks if t.get('split') == 'test')
+        val_count = sum(1 for t in job.progress.created_tasks if t.get('split') == 'val')
+
+        train_images = sum(t['images'] for t in job.progress.created_tasks if t.get('split') == 'train')
+        test_images = sum(t['images'] for t in job.progress.created_tasks if t.get('split') == 'test')
+        val_images = sum(t['images'] for t in job.progress.created_tasks if t.get('split') == 'val')
 
         job.result_summary = f"""
 ## ✅ 批次處理完成!
@@ -1179,17 +1509,23 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
 - **來源專案**: {source_project['name']}
 - **掃描任務數**: {total_tasks}
 - **掃描總幀數**: {total_frames}
-- **檢測到物件**: {len(detected_images)} 張
+- **檢測到物件**: {job.progress.detected_count} 張
 
 ### 資料集分割
-- **Train**: {sum(t['images'] for t in train_tasks)} 張 ({len(train_tasks)} 個任務)
-- **Test**: {sum(t['images'] for t in test_tasks)} 張 ({len(test_tasks)} 個任務)
-- **Validation**: {sum(t['images'] for t in val_tasks)} 張 ({len(val_tasks)} 個任務)
+- **Train**: {train_images} 張 ({train_count} 個任務)
+- **Test**: {test_images} 張 ({test_count} 個任務)
+- **Validation**: {val_images} 張 ({val_count} 個任務)
 
 ### 輸出結果
-- **建立任務數**: {len(created_tasks)}
-- **總標註數**: {total_annotations}
+- **建立任務數**: {len(job.progress.created_tasks)}
+- **總標註數**: {total_annotations[0]}
+- **上傳錯誤**: {job.progress.upload_errors} 次
 """
+
+        if upload_errors:
+            job.result_summary += f"\n### ⚠️ 上傳錯誤\n"
+            for err in upload_errors[:5]:
+                job.result_summary += f"- {err}\n"
 
     except Exception as e:
         job.error_message = str(e)
@@ -1210,6 +1546,8 @@ def start_background_batch_job(
     merge_regions: bool,
     merge_kernel_size: int,
     merge_method: str,
+    source_server_url: str = None,
+    target_server_url: str = None,
 ):
     """Start a batch job in the background."""
     if not source_project_id:
@@ -1222,9 +1560,10 @@ def start_background_batch_job(
         return "❌ 請選擇標籤", None
 
     try:
-        client = get_cvat_client()
-        source_project = client.get_project(source_project_id)
-        target_project = client.get_project(target_project_id)
+        source_client = get_cvat_client(source_server_url)
+        target_client = get_cvat_client(target_server_url)
+        source_project = source_client.get_project(source_project_id)
+        target_project = target_client.get_project(target_project_id)
 
         manager = get_job_manager()
         job = manager.create_job(
@@ -1242,15 +1581,22 @@ def start_background_batch_job(
             merge_regions=merge_regions,
             merge_kernel_size=int(merge_kernel_size),
             merge_method=merge_method,
+            source_server_url=source_server_url,
+            target_server_url=target_server_url,
         )
 
         manager.start_job(job.job_id, run_batch_job_background)
+
+        source_server_name = source_server_url.replace("http://", "").replace(":8080", "") if source_server_url else "default"
+        target_server_name = target_server_url.replace("http://", "").replace(":8080", "") if target_server_url else "default"
 
         return f"""
 ## ✅ 後台任務已啟動!
 
 - **任務 ID**: `{job.job_id}`
+- **來源伺服器**: {source_server_name}
 - **來源專案**: {source_project['name']}
+- **目標伺服器**: {target_server_name}
 - **目標專案**: {target_project['name']}
 - **搜尋物件**: {prompt}
 
@@ -1285,7 +1631,11 @@ def get_job_status_display():
 
         progress_text = ""
         if job.status == JobStatus.RUNNING:
-            progress_text = f" ({job.progress.percentage:.1f}%)"
+            eta_text = job.progress.get_eta_formatted()
+            phase = {"scanning": "掃描", "uploading": "上傳", "completed": "完成"}.get(
+                job.progress.current_phase, job.progress.current_phase
+            )
+            progress_text = f" ({phase} {job.progress.percentage:.1f}% - 剩餘: {eta_text})"
 
         status_lines.append(
             f"{status_emoji} `{job.job_id}` - {job.prompt} → {job.target_project_name}{progress_text}"
@@ -1314,13 +1664,22 @@ def get_job_detail(job_id: str):
         JobStatus.CANCELLED: "⏹️ 已取消",
     }.get(job.status, "❓ 未知")
 
+    # Phase display
+    phase_emoji = {
+        "scanning": "🔍 掃描中",
+        "uploading": "📤 上傳中",
+        "completed": "✅ 已完成"
+    }.get(job.progress.current_phase, job.progress.current_phase)
+
     detail = f"""
 ## 任務詳情: `{job.job_id}`
 
 ### 狀態: {status_emoji}
 
 ### 設定
+- **來源伺服器**: {job.source_server_url or '預設'}
 - **來源專案**: {job.source_project_name} (ID: {job.source_project_id})
+- **目標伺服器**: {job.target_server_url or '預設'}
 - **目標專案**: {job.target_project_name} (ID: {job.target_project_id})
 - **搜尋物件**: {job.prompt}
 - **標籤**: {job.label_name}
@@ -1328,13 +1687,37 @@ def get_job_detail(job_id: str):
 - **每任務圖片數**: {job.images_per_task}
 - **Train/Test/Val 比例**: {job.train_ratio}/{job.test_ratio}/{job.val_ratio}
 
-### 進度
+### 掃描進度
+- **階段**: {phase_emoji}
 - **已處理幀數**: {job.progress.processed_frames} / {job.progress.total_frames}
-- **進度百分比**: {job.progress.percentage:.1f}%
+- **掃描進度**: {job.progress.percentage:.1f}%
 - **檢測到物件**: {job.progress.detected_count} 張
-- **當前任務**: {job.progress.current_task}
-- **已建立任務數**: {len(job.progress.created_tasks)}
+- **當前來源任務**: {job.progress.current_task}
+"""
 
+    # Add streaming upload progress
+    if job.progress.batches_queued > 0 or job.progress.batches_uploaded > 0:
+        detail += f"""
+### 上傳進度 (串流模式)
+- **已排隊批次**: {job.progress.batches_queued}
+- **已上傳批次**: {job.progress.batches_uploaded}
+- **已上傳圖片**: {job.progress.images_uploaded} 張
+- **上傳錯誤**: {job.progress.upload_errors} 次
+- **已建立任務**: {len(job.progress.created_tasks)} 個
+"""
+
+    # Add ETA if job is running
+    if job.status == JobStatus.RUNNING:
+        eta_text = job.progress.get_eta_formatted()
+        speed = job.progress.get_processing_speed()
+        speed_text = f"{speed:.2f} 幀/秒" if speed else "計算中..."
+        detail += f"""
+### ⏱️ 預估時間
+- **處理速度**: {speed_text}
+- **預估剩餘時間**: {eta_text}
+"""
+
+    detail += f"""
 ### 時間
 - **建立時間**: {job.created_at.strftime('%Y-%m-%d %H:%M:%S')}
 - **開始時間**: {job.started_at.strftime('%Y-%m-%d %H:%M:%S') if job.started_at else 'N/A'}
@@ -1347,11 +1730,14 @@ def get_job_detail(job_id: str):
     if job.result_summary:
         detail += f"\n{job.result_summary}\n"
 
-    # Created tasks
+    # Created tasks with correct server URL
     if job.progress.created_tasks:
+        target_server = job.target_server_url or "http://192.168.50.15:8080"
         detail += "\n### 已建立的任務\n"
-        for t in job.progress.created_tasks:
-            detail += f"- [{t['task_name']}](http://192.168.50.15:8080/tasks/{t['task_id']}) - {t['images']} 張圖片, {t['annotations']} 個標註\n"
+        for t in job.progress.created_tasks[-10:]:  # Show last 10 tasks
+            detail += f"- [{t['task_name']}]({target_server}/tasks/{t['task_id']}) - {t['images']} 張, {t['annotations']} 標註\n"
+        if len(job.progress.created_tasks) > 10:
+            detail += f"- ... 還有 {len(job.progress.created_tasks) - 10} 個任務\n"
 
     log_text = "\n".join(job.log_messages[-30:])
 
@@ -1502,7 +1888,7 @@ def create_interface():
                         confidence_slider = gr.Slider(
                             minimum=0.1,
                             maximum=0.95,
-                            value=0.9,
+                            value=0.6,
                             step=0.05,
                             label="信心度閾值"
                         )
@@ -1598,6 +1984,15 @@ def create_interface():
                     with gr.Column(scale=1):
                         gr.Markdown("#### 來源設定")
 
+                        # Source server selection
+                        batch_source_server = gr.Dropdown(
+                            label="來源 CVAT 伺服器",
+                            choices=CVAT_SERVERS,
+                            value="http://192.168.50.15:8080",
+                            interactive=True,
+                            allow_custom_value=False
+                        )
+
                         # Refresh for batch tab
                         batch_refresh_btn = gr.Button("🔄 重新載入專案", size="sm")
 
@@ -1613,6 +2008,18 @@ def create_interface():
                         batch_source_info = gr.Markdown("選擇專案後顯示資訊")
 
                         gr.Markdown("#### 目標設定")
+
+                        # Target server selection
+                        batch_target_server = gr.Dropdown(
+                            label="目標 CVAT 伺服器",
+                            choices=CVAT_SERVERS,
+                            value="http://192.168.50.15:8080",
+                            interactive=True,
+                            allow_custom_value=False
+                        )
+
+                        # Refresh target projects button
+                        batch_refresh_target_btn = gr.Button("🔄 重新載入目標專案", size="sm")
 
                         # Target project
                         batch_target_project = gr.Dropdown(
@@ -1643,7 +2050,7 @@ def create_interface():
                         batch_confidence = gr.Slider(
                             minimum=0.1,
                             maximum=0.95,
-                            value=0.9,
+                            value=0.6,
                             step=0.05,
                             label="信心度閾值"
                         )
@@ -1651,7 +2058,7 @@ def create_interface():
                         # Images per task (ZIP compression allows larger batches)
                         images_per_task = gr.Slider(
                             minimum=50,
-                            maximum=1000,
+                            maximum=10000,
                             value=500,
                             step=50,
                             label="每個任務最大圖片數 (ZIP壓縮上傳)"
@@ -1800,13 +2207,13 @@ def create_interface():
                 gr.update(choices=projects, value=None)
             )
 
-        def on_batch_source_select(project_id):
+        def on_batch_source_select(project_id, server_url):
             """Handle batch source project selection."""
             if not project_id:
                 return "選擇專案後顯示資訊"
 
             try:
-                client = get_cvat_client()
+                client = get_cvat_client(server_url)
                 project = client.get_project(project_id)
                 tasks = client.get_project_tasks(project_id)
                 total_frames = sum(t.get("size", 0) for t in tasks)
@@ -1818,6 +2225,20 @@ def create_interface():
 """
             except Exception as e:
                 return f"錯誤: {str(e)}"
+
+        def on_source_server_change(server_url):
+            """Handle source server selection change."""
+            projects = load_projects(server_url)
+            return gr.update(choices=projects, value=None), "選擇專案後顯示資訊"
+
+        def on_target_server_change(server_url):
+            """Handle target server selection change."""
+            projects = load_projects(server_url)
+            return gr.update(choices=projects, value=None), gr.update(choices=[], value=None)
+
+        def on_target_project_change(project_id, server_url):
+            """Handle target project selection, load labels from correct server."""
+            return load_project_labels(project_id, server_url)
 
         def update_ratio_warning(train, test, val):
             """Update the ratio warning message."""
@@ -1877,21 +2298,41 @@ def create_interface():
             outputs=[batch_summary, batch_gallery]
         )
 
-        # Batch tab events
+        # Batch tab events - server selection
+        batch_source_server.change(
+            fn=on_source_server_change,
+            inputs=[batch_source_server],
+            outputs=[batch_source_project, batch_source_info]
+        )
+
+        batch_target_server.change(
+            fn=on_target_server_change,
+            inputs=[batch_target_server],
+            outputs=[batch_target_project, batch_label_dropdown]
+        )
+
+        # Refresh buttons
         batch_refresh_btn.click(
-            fn=refresh_all_projects,
-            outputs=[project_dropdown, upload_project_dropdown, batch_source_project, batch_target_project]
+            fn=on_source_server_change,
+            inputs=[batch_source_server],
+            outputs=[batch_source_project, batch_source_info]
+        )
+
+        batch_refresh_target_btn.click(
+            fn=on_target_server_change,
+            inputs=[batch_target_server],
+            outputs=[batch_target_project, batch_label_dropdown]
         )
 
         batch_source_project.change(
             fn=on_batch_source_select,
-            inputs=[batch_source_project],
+            inputs=[batch_source_project, batch_source_server],
             outputs=[batch_source_info]
         )
 
         batch_target_project.change(
-            fn=load_project_labels,
-            inputs=[batch_target_project],
+            fn=on_target_project_change,
+            inputs=[batch_target_project, batch_target_server],
             outputs=[batch_label_dropdown]
         )
 
@@ -1927,7 +2368,9 @@ def create_interface():
                 val_ratio,
                 merge_checkbox,
                 merge_kernel_slider,
-                merge_method_dropdown
+                merge_method_dropdown,
+                batch_source_server,
+                batch_target_server
             ],
             outputs=[batch_status, batch_log]
         )
@@ -2003,13 +2446,18 @@ def create_interface():
 
         # Load projects and job list on startup
         def load_all_on_startup():
-            projects = load_projects()
+            # Load projects from default server for single frame tab
+            default_projects = load_projects()
+            # Load projects from default batch servers
+            default_server = "http://192.168.50.15:8080"
+            batch_source_projects = load_projects(default_server)
+            batch_target_projects = load_projects(default_server)
             status, choices, _ = get_job_status_display()
             return (
-                gr.update(choices=projects, value=None),
-                gr.update(choices=projects, value=None),
-                gr.update(choices=projects, value=None),
-                gr.update(choices=projects, value=None),
+                gr.update(choices=default_projects, value=None),
+                gr.update(choices=default_projects, value=None),
+                gr.update(choices=batch_source_projects, value=None),
+                gr.update(choices=batch_target_projects, value=None),
                 status,
                 gr.update(choices=choices)
             )

@@ -88,7 +88,7 @@ class CVATSam3Service:
     def __init__(
         self,
         cvat_config: CVATConfig,
-        confidence_threshold: float = 0.5,
+        confidence_threshold: float = 0.6,
         load_model_on_init: bool = False
     ):
         """
