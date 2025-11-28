@@ -305,22 +305,24 @@ def detect_objects_batch(
                 }
 
                 # Extract single image features from batch
+                # IMPORTANT: Use .clone() to create independent copies, not views!
+                # Otherwise all single_states share the same underlying tensor
                 for key, value in backbone_out.items():
                     if isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
-                        single_state["backbone_out"][key] = value[i:i+1]
+                        single_state["backbone_out"][key] = value[i:i+1].clone()
                     elif isinstance(value, dict):
                         single_state["backbone_out"][key] = {}
                         for k, v in value.items():
                             if isinstance(v, torch.Tensor) and len(v.shape) > 0 and v.shape[0] == batch_size:
-                                single_state["backbone_out"][key][k] = v[i:i+1]
+                                single_state["backbone_out"][key][k] = v[i:i+1].clone()
                             elif isinstance(v, list) and len(v) == batch_size:
-                                single_state["backbone_out"][key][k] = [v[i]]
+                                single_state["backbone_out"][key][k] = [v[i].clone() if isinstance(v[i], torch.Tensor) else v[i]]
                             else:
-                                single_state["backbone_out"][key][k] = v
+                                single_state["backbone_out"][key][k] = v.clone() if isinstance(v, torch.Tensor) else v
                     elif isinstance(value, list) and len(value) == batch_size:
-                        single_state["backbone_out"][key] = [value[i]]
+                        single_state["backbone_out"][key] = [value[i].clone() if isinstance(value[i], torch.Tensor) else value[i]]
                     else:
-                        single_state["backbone_out"][key] = value
+                        single_state["backbone_out"][key] = value.clone() if isinstance(value, torch.Tensor) else value
 
                 # Run grounding for this image
                 output = processor._forward_grounding(single_state)
@@ -343,11 +345,12 @@ def detect_objects_batch(
                     if masks.ndim == 4:
                         masks = masks.squeeze(1)
 
+                    # IMPORTANT: Create independent copies to avoid shared memory issues
                     results.append({
                         "detected": True,
                         "num_objects": len(masks),
-                        "masks": masks,
-                        "scores": scores
+                        "masks": masks.copy(),
+                        "scores": scores.copy() if scores is not None else None
                     })
 
             except Exception as e:
@@ -746,13 +749,14 @@ def batch_scan_project(
                         img_buffer = io.BytesIO()
                         item["image"].save(img_buffer, format='JPEG', quality=95)
                         img_bytes = img_buffer.getvalue()
-                        # Use zero-padded sequential number as filename prefix to ensure correct sort order
-                        filename = f"{img_idx:06d}_{item['source_task']}_frame{item['source_frame']:06d}.jpg"
+                        # Use ONLY zero-padded sequential number as filename to ensure CVAT sorts correctly
+                        # Avoid special characters/spaces that may cause filename mismatch after upload
+                        filename = f"{img_idx:06d}.jpg"
                         files.append((filename, img_bytes))
                         file_metadata.append({
                             "filename": filename,
                             "item": item,
-                            "expected_frame": img_idx  # This should match CVAT frame number after sort
+                            "expected_frame": img_idx  # This matches CVAT frame number after alphabetical sort
                         })
 
                     # Create ZIP archive in memory
@@ -1065,7 +1069,9 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                         img_buffer = io.BytesIO()
                         item["image"].save(img_buffer, format='JPEG', quality=95)
                         img_bytes = img_buffer.getvalue()
-                        filename = f"{img_idx:06d}_{item['source_task']}_frame{item['source_frame']:06d}.jpg"
+                        # Use ONLY zero-padded sequential number as filename to ensure CVAT sorts correctly
+                        # Avoid special characters/spaces that may cause filename mismatch after upload
+                        filename = f"{img_idx:06d}.jpg"
                         files.append((filename, img_bytes))
                         file_metadata.append({
                             "filename": filename,
@@ -1145,16 +1151,29 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                         if basename != fname:
                             filename_to_frame[basename] = frame_num
 
+                    # Log frame mapping info for debugging
+                    if frames_info:
+                        logger.info(f"Task {new_task_id}: {len(frames_info)} frames, sample: {[f.get('name', '') for f in frames_info[:3]]}")
+
                     # Create annotations
                     shapes = []
                     group_id_counter = 1
+                    mapping_misses = 0
 
                     for meta_item in file_metadata:
                         filename = meta_item["filename"]
                         expected_frame = meta_item["expected_frame"]
                         masks = meta_item["masks"]
 
-                        frame_num = filename_to_frame.get(filename, expected_frame)
+                        # Try to find frame by filename, fallback to expected_frame
+                        frame_num = filename_to_frame.get(filename)
+                        if frame_num is None:
+                            frame_num = filename_to_frame.get(os.path.basename(filename))
+                        if frame_num is None:
+                            mapping_misses += 1
+                            frame_num = expected_frame
+                            if mapping_misses <= 3:
+                                logger.warning(f"Frame mapping miss for '{filename}', using expected_frame={expected_frame}")
 
                         if hasattr(masks, 'cpu'):
                             masks = masks.cpu().numpy()
@@ -1184,6 +1203,12 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                                         "group": current_group_id,
                                         "attributes": []
                                     })
+
+                    # Log mapping summary
+                    if mapping_misses > 0:
+                        logger.warning(f"Task {new_task_id}: {mapping_misses}/{len(images_data)} frame mappings used fallback")
+                    else:
+                        logger.info(f"Task {new_task_id}: All {len(images_data)} frame mappings successful")
 
                     # Clear file_metadata to free memory
                     file_metadata.clear()
@@ -1362,58 +1387,46 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
         task_frame_counts = {task["name"]: task.get("size", 0) for task in source_tasks}
         task_names_ordered = [task["name"] for task in source_tasks]
 
-        # ============ BATCH INFERENCE SETTINGS ============
-        INFERENCE_BATCH_SIZE = 8  # Process 8 images at once for GPU efficiency
-        batch_buffer = []  # Accumulate images for batch processing
-        job.add_log(f"🚀 批次推論模式: 每 {INFERENCE_BATCH_SIZE} 張圖片一次 GPU 處理")
+        # ============ SINGLE IMAGE INFERENCE (disabled batch mode due to shared state issues) ============
+        job.add_log(f"🔍 單圖推論模式: 逐張處理以確保標註正確")
 
-        def process_batch(batch_items):
-            """Process a batch of images with SAM3 batch inference."""
-            nonlocal processed_frames
+        def process_single_image(item):
+            """Process a single image with SAM3 inference."""
+            image = item["image"]
+            task_name = item["task_name"]
+            frame_num = item["frame_num"]
 
-            if not batch_items:
-                return
+            # Run single image detection using the reliable detect_objects function
+            _, detection_info = detect_objects(image, job.prompt, job.confidence_threshold)
 
-            # Extract images for batch inference
-            images = [item["image"] for item in batch_items]
+            if detection_info.get("detected", False) and detection_info.get("masks") is not None:
+                job.progress.detected_count += 1
 
-            # Run batch detection
-            batch_results = detect_objects_batch(images, job.prompt, job.confidence_threshold)
-
-            # Process results
-            for item, detection_info in zip(batch_items, batch_results):
-                image = item["image"]
-                task_name = item["task_name"]
-                frame_num = item["frame_num"]
-
-                if detection_info.get("detected", False) and detection_info.get("masks") is not None:
-                    job.progress.detected_count += 1
-
-                    # Assign to split using probability
-                    r = random.random()
-                    if r < train_prob:
-                        split = "train"
-                    elif r < train_prob + test_prob:
-                        split = "test"
-                    else:
-                        split = "val"
-
-                    split_buffers[split].append({
-                        "image": image,
-                        "masks": detection_info["masks"],
-                        "scores": detection_info.get("scores"),
-                        "source_task": task_name,
-                        "source_frame": frame_num
-                    })
-
-                    # Check if buffer is full
-                    if len(split_buffers[split]) >= job.images_per_task:
-                        flush_buffer(split)
+                # Assign to split using probability
+                r = random.random()
+                if r < train_prob:
+                    split = "train"
+                elif r < train_prob + test_prob:
+                    split = "test"
                 else:
-                    # Release image memory if not detected
-                    del image
+                    split = "val"
 
-        # ============ MAIN PROCESSING LOOP (with batch inference) ============
+                split_buffers[split].append({
+                    "image": image,
+                    "masks": detection_info["masks"].copy() if hasattr(detection_info["masks"], 'copy') else detection_info["masks"],
+                    "scores": detection_info.get("scores").copy() if detection_info.get("scores") is not None and hasattr(detection_info.get("scores"), 'copy') else detection_info.get("scores"),
+                    "source_task": task_name,
+                    "source_frame": frame_num
+                })
+
+                # Check if buffer is full
+                if len(split_buffers[split]) >= job.images_per_task:
+                    flush_buffer(split)
+            else:
+                # Release image memory if not detected
+                del image
+
+        # ============ MAIN PROCESSING LOOP (single image inference) ============
         prefetch_done = False
         while True:
             if cancel_flag.is_set():
@@ -1421,55 +1434,48 @@ def run_batch_job_background(job: BatchJob, cancel_flag):
                 prefetch_stop.set()
                 break
 
-            # Accumulate images into batch
-            while len(batch_buffer) < INFERENCE_BATCH_SIZE:
-                try:
-                    item = prefetch_queue.get(timeout=0.1)
-                except queue.Empty:
+            # Get next image from prefetch queue
+            try:
+                item = prefetch_queue.get(timeout=0.1)
+            except queue.Empty:
+                if prefetch_done:
                     break
+                continue
 
-                if item is None:  # Poison pill - prefetch done
-                    prefetch_done = True
-                    break
+            if item is None:  # Poison pill - prefetch done
+                prefetch_done = True
+                break
 
-                task_id, task_name, frame_num, image, error = item
+            task_id, task_name, frame_num, image, error = item
 
-                # Update progress tracking
-                if task_name != current_task_name:
-                    current_task_name = task_name
-                    if task_name in task_names_ordered:
-                        current_task_idx = task_names_ordered.index(task_name) + 1
-                    job.progress.current_step = current_task_idx
-                    job.progress.current_task = task_name
-                    job.progress.task_frames = task_frame_counts.get(task_name, 0)
-                    job.add_log(f"掃描任務 {current_task_idx}/{total_tasks}: {task_name} (預載: {prefetch_queue.qsize()}, 批次: {len(batch_buffer)})")
+            # Update progress tracking
+            if task_name != current_task_name:
+                current_task_name = task_name
+                if task_name in task_names_ordered:
+                    current_task_idx = task_names_ordered.index(task_name) + 1
+                job.progress.current_step = current_task_idx
+                job.progress.current_task = task_name
+                job.progress.task_frames = task_frame_counts.get(task_name, 0)
+                job.add_log(f"掃描任務 {current_task_idx}/{total_tasks}: {task_name} (預載: {prefetch_queue.qsize()})")
 
-                processed_frames += 1
-                job.progress.processed_frames = processed_frames
-                job.progress.current_frame = frame_num + 1
+            processed_frames += 1
+            job.progress.processed_frames = processed_frames
+            job.progress.current_frame = frame_num + 1
 
-                # Handle download error
-                if image is None:
-                    logger.warning(f"Prefetch error {task_name} frame {frame_num}: {error}")
-                    continue
+            # Handle download error
+            if image is None:
+                logger.warning(f"Prefetch error {task_name} frame {frame_num}: {error}")
+                continue
 
-                batch_buffer.append({
+            # Process single image
+            try:
+                process_single_image({
                     "image": image,
                     "task_name": task_name,
                     "frame_num": frame_num
                 })
-
-            # Process batch when full or when prefetch is done
-            if len(batch_buffer) >= INFERENCE_BATCH_SIZE or (prefetch_done and batch_buffer):
-                try:
-                    process_batch(batch_buffer)
-                except Exception as e:
-                    logger.warning(f"Batch processing error: {e}")
-                batch_buffer = []
-
-            # Exit when prefetch is done and batch is empty
-            if prefetch_done and not batch_buffer:
-                break
+            except Exception as e:
+                logger.warning(f"Image processing error {task_name} frame {frame_num}: {e}")
 
         # Stop prefetch thread
         prefetch_stop.set()
@@ -1823,6 +1829,360 @@ def on_detect(task_id, frame_number, prompt, confidence):
             result_text += f"  - 物件 {i+1}: {score*100:.1f}%\n"
 
     return result_image, result_text
+
+
+# ============ Task Copy Functions ============
+
+def get_server_url_by_name(server_name: str) -> str:
+    """Convert server display name to URL."""
+    for name, url in CVAT_SERVERS:
+        if name == server_name:
+            return url
+    return CVAT_SERVERS[0][1]
+
+
+def copy_on_source_server_change(server_name: str):
+    """Handle source server change in copy tab."""
+    server_url = get_server_url_by_name(server_name)
+    projects = load_projects(server_url)
+    return (
+        gr.update(choices=projects, value=None),
+        gr.update(choices=[], value=None),
+        "選擇專案後顯示資訊"
+    )
+
+
+def copy_on_target_server_change(server_name: str):
+    """Handle target server change in copy tab."""
+    server_url = get_server_url_by_name(server_name)
+    projects = load_projects(server_url)
+    return gr.update(choices=projects, value=None), "選擇專案後顯示標籤"
+
+
+def copy_on_source_project_change(project_id, server_name: str):
+    """Handle source project selection in copy tab."""
+    if not project_id:
+        return gr.update(choices=[], value=None), "選擇專案後顯示資訊"
+
+    try:
+        server_url = get_server_url_by_name(server_name)
+        client = get_cvat_client(server_url)
+        project = client.get_project(project_id)
+        tasks = client.get_project_tasks(project_id)
+
+        task_choices = [(f"{t['name']} ({t.get('size', 0)} 幀)", t['id']) for t in tasks]
+        total_frames = sum(t.get("size", 0) for t in tasks)
+
+        # Get labels
+        labels = client.get_labels(project_id=project_id)
+        label_names = [l.get("name", "") for l in labels]
+
+        info = f"""
+**專案名稱**: {project['name']}
+**任務數量**: {len(tasks)}
+**總幀數**: {total_frames}
+**標籤**: {', '.join(label_names) if label_names else '無'}
+"""
+        return gr.update(choices=task_choices, value=None), info
+    except Exception as e:
+        return gr.update(choices=[], value=None), f"錯誤: {str(e)}"
+
+
+def copy_on_target_project_change(project_id, server_name: str):
+    """Handle target project selection in copy tab."""
+    if not project_id:
+        return "選擇專案後顯示標籤"
+
+    try:
+        server_url = get_server_url_by_name(server_name)
+        client = get_cvat_client(server_url)
+        project = client.get_project(project_id)
+        labels = client.get_labels(project_id=project_id)
+        label_names = [l.get("name", "") for l in labels]
+
+        info = f"""
+**專案名稱**: {project['name']}
+**可用標籤**: {', '.join(label_names) if label_names else '無'}
+"""
+        return info
+    except Exception as e:
+        return f"錯誤: {str(e)}"
+
+
+def copy_select_all_tasks(project_id, server_name: str):
+    """Select all tasks in a project."""
+    if not project_id:
+        return gr.update()
+
+    try:
+        server_url = get_server_url_by_name(server_name)
+        client = get_cvat_client(server_url)
+        tasks = client.get_project_tasks(project_id)
+        task_ids = [t['id'] for t in tasks]
+        return gr.update(value=task_ids)
+    except Exception as e:
+        logger.error(f"Error selecting all tasks: {e}")
+        return gr.update()
+
+
+def copy_load_label_mapping(source_project_id, source_server_name, target_project_id, target_server_name):
+    """Load labels from both projects and create mapping suggestion."""
+    if not source_project_id or not target_project_id:
+        return "請先選擇來源和目標專案", ""
+
+    try:
+        source_url = get_server_url_by_name(source_server_name)
+        target_url = get_server_url_by_name(target_server_name)
+
+        source_client = get_cvat_client(source_url)
+        target_client = get_cvat_client(target_url)
+
+        source_labels = source_client.get_labels(project_id=source_project_id)
+        target_labels = target_client.get_labels(project_id=target_project_id)
+
+        source_label_names = [l.get("name", "") for l in source_labels]
+        target_label_names = [l.get("name", "") for l in target_labels]
+
+        # Create suggested mapping
+        mapping = {}
+        for sl in source_label_names:
+            if sl in target_label_names:
+                mapping[sl] = sl  # Same name exists
+            else:
+                mapping[sl] = "skip"  # Default to skip if not found
+
+        import json
+        mapping_json = json.dumps(mapping, ensure_ascii=False, indent=2)
+
+        info = f"""
+**來源標籤** ({len(source_label_names)}): {', '.join(source_label_names) if source_label_names else '無'}
+
+**目標標籤** ({len(target_label_names)}): {', '.join(target_label_names) if target_label_names else '無'}
+
+*已自動產生對應建議，相同名稱自動對應，其他設為 skip*
+"""
+        return info, mapping_json
+    except Exception as e:
+        return f"錯誤: {str(e)}", ""
+
+
+# Global state for copy operation
+_copy_cancel_flag = None
+_copy_thread = None
+
+
+def start_copy_tasks(
+    source_project_id,
+    source_server_name,
+    source_task_ids,
+    target_project_id,
+    target_server_name,
+    copy_images,
+    copy_annotations,
+    task_name_prefix,
+    label_mapping_json
+):
+    """Start copying tasks from source to target."""
+    import json
+    import threading
+    import io
+    import zipfile
+    global _copy_cancel_flag, _copy_thread
+
+    if not source_project_id or not target_project_id:
+        return "❌ 請選擇來源和目標專案", ""
+
+    if not source_task_ids:
+        return "❌ 請選擇要複製的任務", ""
+
+    # Parse label mapping
+    label_mapping = {}
+    if label_mapping_json and label_mapping_json.strip():
+        try:
+            label_mapping = json.loads(label_mapping_json)
+        except json.JSONDecodeError as e:
+            return f"❌ 標籤對應 JSON 格式錯誤: {e}", ""
+
+    source_url = get_server_url_by_name(source_server_name)
+    target_url = get_server_url_by_name(target_server_name)
+
+    source_client = get_cvat_client(source_url)
+    target_client = get_cvat_client(target_url)
+
+    # Get target labels for ID lookup
+    target_labels = target_client.get_labels(project_id=target_project_id)
+    target_label_map = {l.get("name", ""): l.get("id") for l in target_labels}
+
+    logs = []
+    logs.append(f"開始複製 {len(source_task_ids)} 個任務")
+    logs.append(f"來源: {source_server_name}, 目標: {target_server_name}")
+    logs.append(f"標籤對應: {label_mapping}")
+
+    total_tasks = len(source_task_ids)
+    completed = 0
+    errors = 0
+
+    for task_id in source_task_ids:
+        try:
+            # Get source task info
+            source_task = source_client.get_task(task_id)
+            task_name = source_task.get("name", f"task_{task_id}")
+            task_size = source_task.get("size", 0)
+
+            new_task_name = f"{task_name_prefix}{task_name}" if task_name_prefix else task_name
+            logs.append(f"\n📋 處理任務: {task_name} ({task_size} 幀)")
+
+            if copy_images:
+                # Download all frames and create ZIP
+                logs.append(f"  ⬇️ 下載圖片...")
+                files = []
+                for frame_num in range(task_size):
+                    try:
+                        image = source_client.get_task_frame(task_id, frame_num, "compressed")
+                        if image:
+                            img_buffer = io.BytesIO()
+                            image.save(img_buffer, format='JPEG', quality=95)
+                            files.append((f"{frame_num:06d}.jpg", img_buffer.getvalue()))
+                    except Exception as e:
+                        logs.append(f"  ⚠️ 幀 {frame_num} 下載失敗: {e}")
+
+                if not files:
+                    logs.append(f"  ❌ 無法下載任何圖片，跳過")
+                    errors += 1
+                    continue
+
+                # Create ZIP
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for filename, img_bytes in files:
+                        zf.writestr(filename, img_bytes)
+                zip_buffer.seek(0)
+                zip_bytes = zip_buffer.getvalue()
+
+                # Create task in target
+                logs.append(f"  ⬆️ 建立目標任務: {new_task_name}")
+                new_task = target_client.create_task(new_task_name, target_project_id)
+                new_task_id = new_task["id"]
+
+                # Upload images
+                url = f"{target_client.base_url}/api/tasks/{new_task_id}/data"
+                headers = {"Authorization": f"Token {target_client.token}"}
+                multipart_files = [('client_files[0]', (f"{new_task_name}.zip", zip_bytes, 'application/zip'))]
+                data = {"image_quality": 70}
+
+                response = target_client.session.post(url, headers=headers, files=multipart_files, data=data, timeout=600)
+                response.raise_for_status()
+
+                # Wait for task to be ready
+                for _ in range(300):
+                    import time
+                    task_info = target_client.get_task(new_task_id)
+                    if task_info.get("size", 0) >= len(files):
+                        break
+                    time.sleep(1)
+
+                logs.append(f"  ✓ 圖片上傳完成 ({len(files)} 張)")
+
+                # Copy annotations if enabled
+                if copy_annotations and label_mapping:
+                    logs.append(f"  📝 複製標註...")
+
+                    # Get source annotations
+                    ann_url = f"{source_client.base_url}/api/tasks/{task_id}/annotations"
+                    ann_response = source_client.session.get(ann_url, headers=source_client._get_headers(), timeout=60)
+                    ann_response.raise_for_status()
+                    source_annotations = ann_response.json()
+
+                    # Transform annotations with label mapping
+                    new_shapes = []
+                    skipped = 0
+
+                    # Get source label id to name mapping
+                    source_labels = source_client.get_labels(task_id=task_id)
+                    source_label_id_to_name = {l.get("id"): l.get("name", "") for l in source_labels}
+
+                    # Get target task labels (not project labels)
+                    target_task_labels = target_client.get_labels(task_id=new_task_id)
+                    target_task_label_map = {l.get("name", ""): l.get("id") for l in target_task_labels}
+
+                    for shape in source_annotations.get("shapes", []):
+                        source_label_id = shape.get("label_id")
+                        source_label_name = source_label_id_to_name.get(source_label_id, "")
+
+                        # Apply mapping
+                        target_label_name = label_mapping.get(source_label_name, "keep")
+
+                        if target_label_name == "skip":
+                            skipped += 1
+                            continue
+                        elif target_label_name == "keep":
+                            target_label_name = source_label_name
+
+                        # Get target label ID from task labels
+                        target_label_id = target_task_label_map.get(target_label_name)
+                        if target_label_id is None:
+                            skipped += 1
+                            continue
+
+                        # Create clean shape without source-specific fields
+                        new_shape = {
+                            "type": shape.get("type"),
+                            "occluded": shape.get("occluded", False),
+                            "z_order": shape.get("z_order", 0),
+                            "points": shape.get("points", []),
+                            "frame": shape.get("frame", 0),
+                            "label_id": target_label_id,
+                            "group": shape.get("group", 0),
+                            "attributes": []
+                        }
+                        # Add rotation if present (for rectangles)
+                        if "rotation" in shape:
+                            new_shape["rotation"] = shape["rotation"]
+                        new_shapes.append(new_shape)
+
+                    # Upload annotations
+                    if new_shapes:
+                        new_annotations = {
+                            "version": 0,
+                            "tags": [],
+                            "shapes": new_shapes,
+                            "tracks": []
+                        }
+                        put_url = f"{target_client.base_url}/api/tasks/{new_task_id}/annotations"
+                        put_response = target_client.session.put(
+                            put_url, headers=target_client._get_headers(),
+                            json=new_annotations, timeout=60
+                        )
+                        put_response.raise_for_status()
+                        logs.append(f"  ✓ 標註上傳完成 ({len(new_shapes)} 個，跳過 {skipped} 個)")
+                    else:
+                        logs.append(f"  ⚠️ 無有效標註可複製 (跳過 {skipped} 個)")
+
+            completed += 1
+            logs.append(f"  ✅ 任務完成")
+
+        except Exception as e:
+            errors += 1
+            logs.append(f"  ❌ 錯誤: {str(e)}")
+            logger.error(f"Copy task error: {e}")
+
+    # Summary
+    summary = f"""
+## 複製完成
+
+- **成功**: {completed}/{total_tasks} 個任務
+- **錯誤**: {errors} 個
+"""
+    return summary, "\n".join(logs)
+
+
+def stop_copy_tasks():
+    """Stop the copy operation."""
+    global _copy_cancel_flag
+    if _copy_cancel_flag:
+        _copy_cancel_flag.set()
+        return "已發送停止請求"
+    return "沒有正在執行的複製任務"
 
 
 def create_interface():
@@ -2192,6 +2552,130 @@ def create_interface():
                             value=False
                         )
 
+            # Tab 4: Task Copy with Label Mapping
+            with gr.TabItem("📋 任務複製"):
+                gr.Markdown("""
+### CVAT 任務複製工具
+
+在不同 CVAT 伺服器或專案之間複製任務，支援標籤對應功能。
+                """)
+
+                with gr.Row():
+                    # Left panel - Source
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 來源設定")
+
+                        copy_source_server = gr.Dropdown(
+                            choices=[s[0] for s in CVAT_SERVERS],
+                            value=CVAT_SERVERS[0][0],
+                            label="來源伺服器"
+                        )
+
+                        with gr.Row():
+                            copy_source_project = gr.Dropdown(
+                                label="來源專案",
+                                choices=[],
+                                interactive=True
+                            )
+                            copy_refresh_source_btn = gr.Button("🔄", size="sm", min_width=40)
+
+                        copy_source_tasks = gr.Dropdown(
+                            label="來源任務 (可多選)",
+                            choices=[],
+                            multiselect=True,
+                            interactive=True
+                        )
+
+                        copy_select_all_btn = gr.Button("全選任務", size="sm")
+
+                        copy_source_info = gr.Markdown("選擇專案後顯示資訊")
+
+                    # Middle panel - Target
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 目標設定")
+
+                        copy_target_server = gr.Dropdown(
+                            choices=[s[0] for s in CVAT_SERVERS],
+                            value=CVAT_SERVERS[0][0],
+                            label="目標伺服器"
+                        )
+
+                        with gr.Row():
+                            copy_target_project = gr.Dropdown(
+                                label="目標專案",
+                                choices=[],
+                                interactive=True
+                            )
+                            copy_refresh_target_btn = gr.Button("🔄", size="sm", min_width=40)
+
+                        copy_target_info = gr.Markdown("選擇專案後顯示標籤")
+
+                        gr.Markdown("#### 複製選項")
+
+                        copy_images_checkbox = gr.Checkbox(
+                            label="複製圖片",
+                            value=True
+                        )
+
+                        copy_annotations_checkbox = gr.Checkbox(
+                            label="複製標註",
+                            value=True
+                        )
+
+                        copy_task_name_prefix = gr.Textbox(
+                            label="任務名稱前綴 (選填)",
+                            placeholder="留空則使用原名稱",
+                            value=""
+                        )
+
+                    # Right panel - Label Mapping
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 標籤對應")
+                        gr.Markdown("*設定來源標籤對應到目標標籤*")
+
+                        copy_load_labels_btn = gr.Button("載入標籤", variant="secondary")
+
+                        copy_label_mapping_display = gr.Markdown("點擊「載入標籤」查看對應設定")
+
+                        # Dynamic label mapping (will be populated)
+                        copy_label_mappings = gr.Dataframe(
+                            headers=["來源標籤", "目標標籤", "動作"],
+                            datatype=["str", "str", "str"],
+                            col_count=(3, "fixed"),
+                            row_count=(0, "dynamic"),
+                            interactive=True,
+                            visible=False
+                        )
+
+                        # Alternative: JSON-based mapping for flexibility
+                        copy_label_mapping_json = gr.Textbox(
+                            label="標籤對應設定 (JSON)",
+                            placeholder='{"來源標籤1": "目標標籤1", "來源標籤2": "skip"}',
+                            lines=5,
+                            visible=True
+                        )
+
+                        gr.Markdown("""
+*動作說明:*
+- `目標標籤名`: 對應到該標籤
+- `skip`: 跳過此標籤
+- `keep`: 保留原標籤名稱
+                        """)
+
+                # Action row
+                with gr.Row():
+                    copy_start_btn = gr.Button("🚀 開始複製", variant="primary", scale=2)
+                    copy_stop_btn = gr.Button("⏹️ 停止", variant="stop", scale=1)
+
+                # Status
+                with gr.Row():
+                    copy_progress = gr.Markdown("準備就緒")
+                    copy_log = gr.Textbox(
+                        label="執行日誌",
+                        lines=10,
+                        interactive=False
+                    )
+
         # Event handlers
         def refresh_projects():
             projects = load_projects()
@@ -2444,6 +2928,76 @@ def create_interface():
             outputs=[job_list_display, job_selector, job_detail_display, job_log_display]
         )
 
+        # ============ Copy Tab Event Handlers ============
+        copy_source_server.change(
+            fn=copy_on_source_server_change,
+            inputs=[copy_source_server],
+            outputs=[copy_source_project, copy_source_tasks, copy_source_info]
+        )
+
+        copy_refresh_source_btn.click(
+            fn=copy_on_source_server_change,
+            inputs=[copy_source_server],
+            outputs=[copy_source_project, copy_source_tasks, copy_source_info]
+        )
+
+        copy_source_project.change(
+            fn=copy_on_source_project_change,
+            inputs=[copy_source_project, copy_source_server],
+            outputs=[copy_source_tasks, copy_source_info]
+        )
+
+        copy_select_all_btn.click(
+            fn=copy_select_all_tasks,
+            inputs=[copy_source_project, copy_source_server],
+            outputs=[copy_source_tasks]
+        )
+
+        copy_target_server.change(
+            fn=copy_on_target_server_change,
+            inputs=[copy_target_server],
+            outputs=[copy_target_project, copy_target_info]
+        )
+
+        copy_refresh_target_btn.click(
+            fn=copy_on_target_server_change,
+            inputs=[copy_target_server],
+            outputs=[copy_target_project, copy_target_info]
+        )
+
+        copy_target_project.change(
+            fn=copy_on_target_project_change,
+            inputs=[copy_target_project, copy_target_server],
+            outputs=[copy_target_info]
+        )
+
+        copy_load_labels_btn.click(
+            fn=copy_load_label_mapping,
+            inputs=[copy_source_project, copy_source_server, copy_target_project, copy_target_server],
+            outputs=[copy_label_mapping_display, copy_label_mapping_json]
+        )
+
+        copy_start_btn.click(
+            fn=start_copy_tasks,
+            inputs=[
+                copy_source_project,
+                copy_source_server,
+                copy_source_tasks,
+                copy_target_project,
+                copy_target_server,
+                copy_images_checkbox,
+                copy_annotations_checkbox,
+                copy_task_name_prefix,
+                copy_label_mapping_json
+            ],
+            outputs=[copy_progress, copy_log]
+        )
+
+        copy_stop_btn.click(
+            fn=stop_copy_tasks,
+            outputs=[copy_progress]
+        )
+
         # Load projects and job list on startup
         def load_all_on_startup():
             # Load projects from default server for single frame tab
@@ -2453,13 +3007,18 @@ def create_interface():
             batch_source_projects = load_projects(default_server)
             batch_target_projects = load_projects(default_server)
             status, choices, _ = get_job_status_display()
+            # Copy tab uses same default server
+            copy_source_projects = load_projects(default_server)
+            copy_target_projects = load_projects(default_server)
             return (
                 gr.update(choices=default_projects, value=None),
                 gr.update(choices=default_projects, value=None),
                 gr.update(choices=batch_source_projects, value=None),
                 gr.update(choices=batch_target_projects, value=None),
                 status,
-                gr.update(choices=choices)
+                gr.update(choices=choices),
+                gr.update(choices=copy_source_projects, value=None),
+                gr.update(choices=copy_target_projects, value=None)
             )
 
         demo.load(
@@ -2470,7 +3029,9 @@ def create_interface():
                 batch_source_project,
                 batch_target_project,
                 job_list_display,
-                job_selector
+                job_selector,
+                copy_source_project,
+                copy_target_project
             ]
         )
 
