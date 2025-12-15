@@ -1971,6 +1971,258 @@ _copy_cancel_flag = None
 _copy_thread = None
 
 
+# ============================================
+# 專注模式複製功能 (Focus Mode Copy)
+# ============================================
+
+def polygon_to_mask(points: List[float], width: int, height: int) -> np.ndarray:
+    """將 CVAT polygon/rectangle 點列表轉換為二值 mask。"""
+    mask = np.zeros((height, width), dtype=np.uint8)
+    pts = np.array(points).reshape(-1, 2).astype(np.int32)
+    cv2.fillPoly(mask, [pts], 255)
+    return mask
+
+
+def apply_mosaic_outside_mask(
+    image: Image.Image,
+    mask: np.ndarray,
+    block_size: int = 20,
+    expand_pixels: int = 10
+) -> Image.Image:
+    """在 mask 區域外套用馬賽克效果。"""
+    img_array = np.array(image)
+    height, width = img_array.shape[:2]
+
+    # 擴展 mask 區域
+    if expand_pixels > 0:
+        kernel = np.ones((expand_pixels * 2 + 1, expand_pixels * 2 + 1), np.uint8)
+        expanded_mask = cv2.dilate(mask, kernel, iterations=1)
+    else:
+        expanded_mask = mask.copy()
+
+    # 創建馬賽克版本：先縮小再放大
+    small_width = max(1, width // block_size)
+    small_height = max(1, height // block_size)
+    small_img = cv2.resize(img_array, (small_width, small_height), interpolation=cv2.INTER_LINEAR)
+    mosaic_img = cv2.resize(small_img, (width, height), interpolation=cv2.INTER_NEAREST)
+
+    # 合併：mask 區域保留原圖，其他區域使用馬賽克
+    result = mosaic_img.copy()
+    result[expanded_mask > 0] = img_array[expanded_mask > 0]
+
+    return Image.fromarray(result)
+
+
+def combine_masks(masks: List[np.ndarray]) -> np.ndarray:
+    """合併多個 mask 為一個。"""
+    if not masks:
+        return None
+    combined = masks[0].copy()
+    for m in masks[1:]:
+        combined = np.maximum(combined, m)
+    return combined
+
+
+def start_focus_copy_tasks(
+    source_project_id,
+    source_server_name,
+    source_task_ids,
+    target_project_id,
+    target_server_name,
+    focus_label_name,
+    mosaic_block_size,
+    expand_pixels,
+    task_name_prefix
+):
+    """
+    專注模式任務複製：
+    - 有指定標籤的圖片：標籤區域清晰，其他部分馬賽克
+    - 沒有指定標籤的圖片：保留原圖
+    - 只處理圖片，不複製標註
+    """
+    import io
+    import zipfile
+    import time
+
+    if not source_project_id or not target_project_id:
+        return "❌ 請選擇來源和目標專案", ""
+
+    if not source_task_ids:
+        return "❌ 請選擇要複製的任務", ""
+
+    if not focus_label_name or not focus_label_name.strip():
+        return "❌ 請輸入要專注的標籤名稱", ""
+
+    focus_label_name = focus_label_name.strip()
+    mosaic_block_size = int(mosaic_block_size)
+    expand_pixels = int(expand_pixels)
+
+    source_url = get_server_url_by_name(source_server_name)
+    target_url = get_server_url_by_name(target_server_name)
+
+    source_client = get_cvat_client(source_url)
+    target_client = get_cvat_client(target_url)
+
+    logs = []
+    logs.append(f"🎯 專注模式複製")
+    logs.append(f"專注標籤: {focus_label_name}")
+    logs.append(f"馬賽克大小: {mosaic_block_size}, 擴展像素: {expand_pixels}")
+    logs.append(f"開始處理 {len(source_task_ids)} 個任務")
+
+    total_tasks = len(source_task_ids)
+    completed = 0
+    errors = 0
+    total_mosaic_images = 0
+    total_original_images = 0
+
+    for task_id in source_task_ids:
+        try:
+            # Get source task info
+            source_task = source_client.get_task(task_id)
+            task_name = source_task.get("name", f"task_{task_id}")
+            task_size = source_task.get("size", 0)
+
+            new_task_name = f"{task_name_prefix}{task_name}" if task_name_prefix else task_name
+            logs.append(f"\n📋 處理任務: {task_name} ({task_size} 幀)")
+
+            # Get source annotations
+            ann_url = f"{source_client.base_url}/api/tasks/{task_id}/annotations"
+            ann_response = source_client.session.get(ann_url, headers=source_client._get_headers(), timeout=60)
+            ann_response.raise_for_status()
+            source_annotations = ann_response.json()
+
+            # Get source label id to name mapping
+            source_labels = source_client.get_labels(task_id=task_id)
+            source_label_id_to_name = {l.get("id"): l.get("name", "") for l in source_labels}
+
+            # Group shapes by frame and filter by focus label
+            focus_shapes_by_frame = {}
+            for shape in source_annotations.get("shapes", []):
+                label_id = shape.get("label_id")
+                label_name = source_label_id_to_name.get(label_id, "")
+                if label_name == focus_label_name:
+                    frame = shape.get("frame", 0)
+                    if frame not in focus_shapes_by_frame:
+                        focus_shapes_by_frame[frame] = []
+                    focus_shapes_by_frame[frame].append(shape)
+
+            logs.append(f"  📊 {len(focus_shapes_by_frame)} 張圖片含標籤 '{focus_label_name}'")
+
+            # Process all frames
+            files = []
+            mosaic_count = 0
+            original_count = 0
+
+            for frame_num in range(task_size):
+                try:
+                    image = source_client.get_task_frame(task_id, frame_num, "compressed")
+                    if not image:
+                        continue
+
+                    # Check if this frame has focus label
+                    if frame_num in focus_shapes_by_frame:
+                        # Apply mosaic outside the label regions
+                        width, height = image.size
+                        masks = []
+
+                        for shape in focus_shapes_by_frame[frame_num]:
+                            shape_type = shape.get("type")
+                            points = shape.get("points", [])
+
+                            if shape_type == "polygon" and len(points) >= 6:
+                                mask = polygon_to_mask(points, width, height)
+                                masks.append(mask)
+                            elif shape_type == "rectangle" and len(points) >= 4:
+                                x1, y1, x2, y2 = points[0], points[1], points[2], points[3]
+                                rect_points = [x1, y1, x2, y1, x2, y2, x1, y2]
+                                mask = polygon_to_mask(rect_points, width, height)
+                                masks.append(mask)
+
+                        if masks:
+                            combined_mask = combine_masks(masks)
+                            processed_image = apply_mosaic_outside_mask(
+                                image,
+                                combined_mask,
+                                block_size=mosaic_block_size,
+                                expand_pixels=expand_pixels
+                            )
+                            mosaic_count += 1
+                        else:
+                            processed_image = image
+                            original_count += 1
+                    else:
+                        # No focus label, keep original
+                        processed_image = image
+                        original_count += 1
+
+                    # Save image
+                    img_buffer = io.BytesIO()
+                    processed_image.save(img_buffer, format='JPEG', quality=95)
+                    files.append((f"{frame_num:06d}.jpg", img_buffer.getvalue()))
+
+                except Exception as e:
+                    logs.append(f"  ⚠️ 幀 {frame_num} 處理失敗: {e}")
+
+            if not files:
+                logs.append(f"  ❌ 無法處理任何圖片，跳過")
+                errors += 1
+                continue
+
+            total_mosaic_images += mosaic_count
+            total_original_images += original_count
+            logs.append(f"  🖼️ 馬賽克: {mosaic_count} 張, 原圖: {original_count} 張")
+
+            # Create ZIP
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for filename, img_bytes in files:
+                    zf.writestr(filename, img_bytes)
+            zip_buffer.seek(0)
+            zip_bytes = zip_buffer.getvalue()
+
+            # Create task in target
+            logs.append(f"  ⬆️ 建立目標任務: {new_task_name}")
+            new_task = target_client.create_task(new_task_name, target_project_id)
+            new_task_id = new_task["id"]
+
+            # Upload images
+            url = f"{target_client.base_url}/api/tasks/{new_task_id}/data"
+            headers = {"Authorization": f"Token {target_client.token}"}
+            multipart_files = [('client_files[0]', (f"{new_task_name}.zip", zip_bytes, 'application/zip'))]
+            data = {"image_quality": 70}
+
+            response = target_client.session.post(url, headers=headers, files=multipart_files, data=data, timeout=600)
+            response.raise_for_status()
+
+            # Wait for task to be ready
+            for _ in range(300):
+                task_info = target_client.get_task(new_task_id)
+                if task_info.get("size", 0) >= len(files):
+                    break
+                time.sleep(1)
+
+            logs.append(f"  ✓ 上傳完成 ({len(files)} 張)")
+            completed += 1
+            logs.append(f"  ✅ 任務完成")
+
+        except Exception as e:
+            errors += 1
+            logs.append(f"  ❌ 錯誤: {str(e)}")
+            logger.error(f"Focus copy task error: {e}")
+
+    # Summary
+    summary = f"""
+## 專注模式複製完成
+
+- **專注標籤**: {focus_label_name}
+- **成功**: {completed}/{total_tasks} 個任務
+- **錯誤**: {errors} 個
+- **馬賽克處理**: {total_mosaic_images} 張
+- **保留原圖**: {total_original_images} 張
+"""
+    return summary, "\n".join(logs)
+
+
 def start_copy_tasks(
     source_project_id,
     source_server_name,
@@ -2676,6 +2928,119 @@ def create_interface():
                         interactive=False
                     )
 
+            # Tab 5: Focus Mode Copy (獨立頁籤)
+            with gr.TabItem("🎯 專注模式複製"):
+                gr.Markdown("""
+### 專注模式任務複製
+
+複製任務時，對指定標籤區域外的部分套用馬賽克，讓標記人員專注於需要標記的區域。
+
+**處理邏輯：**
+- 有指定標籤的圖片 → 標籤區域清晰，其他部分馬賽克
+- 沒有指定標籤的圖片 → 保留原圖
+- 只處理圖片，不複製標註
+                """)
+
+                with gr.Row():
+                    # Left panel - Source
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 來源設定")
+
+                        focus_source_server = gr.Dropdown(
+                            choices=[s[0] for s in CVAT_SERVERS],
+                            value=CVAT_SERVERS[0][0],
+                            label="來源伺服器"
+                        )
+
+                        with gr.Row():
+                            focus_source_project = gr.Dropdown(
+                                label="來源專案",
+                                choices=[],
+                                interactive=True
+                            )
+                            focus_refresh_source_btn = gr.Button("🔄", size="sm", min_width=40)
+
+                        focus_source_tasks = gr.Dropdown(
+                            label="來源任務 (可多選)",
+                            choices=[],
+                            multiselect=True,
+                            interactive=True
+                        )
+
+                        focus_select_all_btn = gr.Button("全選任務", size="sm")
+
+                        focus_source_info = gr.Markdown("選擇專案後顯示資訊")
+
+                    # Middle panel - Target
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 目標設定")
+
+                        focus_target_server = gr.Dropdown(
+                            choices=[s[0] for s in CVAT_SERVERS],
+                            value=CVAT_SERVERS[0][0],
+                            label="目標伺服器"
+                        )
+
+                        with gr.Row():
+                            focus_target_project = gr.Dropdown(
+                                label="目標專案",
+                                choices=[],
+                                interactive=True
+                            )
+                            focus_refresh_target_btn = gr.Button("🔄", size="sm", min_width=40)
+
+                        focus_task_name_prefix = gr.Textbox(
+                            label="任務名稱前綴 (選填)",
+                            placeholder="留空則使用原名稱",
+                            value=""
+                        )
+
+                    # Right panel - Focus Settings
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 專注設定")
+
+                        focus_label_name = gr.Textbox(
+                            label="專注標籤名稱",
+                            placeholder="輸入要保留清晰的標籤名稱",
+                            value=""
+                        )
+
+                        focus_mosaic_block_size = gr.Slider(
+                            minimum=5,
+                            maximum=50,
+                            value=20,
+                            step=5,
+                            label="馬賽克強度 (數值越大越模糊)"
+                        )
+
+                        focus_expand_pixels = gr.Slider(
+                            minimum=0,
+                            maximum=50,
+                            value=10,
+                            step=5,
+                            label="保留區域擴展 (像素)"
+                        )
+
+                        gr.Markdown("""
+*說明：*
+- **專注標籤**：該標籤區域會保持清晰
+- **馬賽克強度**：區塊大小，越大越模糊
+- **擴展像素**：讓保留區域邊緣稍微外擴
+                        """)
+
+                # Action row
+                with gr.Row():
+                    focus_start_btn = gr.Button("🚀 開始專注模式複製", variant="primary", scale=2)
+
+                # Status
+                with gr.Row():
+                    focus_progress = gr.Markdown("準備就緒")
+                    focus_log = gr.Textbox(
+                        label="執行日誌",
+                        lines=10,
+                        interactive=False
+                    )
+
         # Event handlers
         def refresh_projects():
             projects = load_projects()
@@ -2996,6 +3361,113 @@ def create_interface():
         copy_stop_btn.click(
             fn=stop_copy_tasks,
             outputs=[copy_progress]
+        )
+
+        # ============================================
+        # Focus Mode Copy Tab Event Handlers
+        # ============================================
+
+        def focus_on_source_server_change(server_name):
+            """Handle focus mode source server change."""
+            server_url = get_server_url_by_name(server_name)
+            projects = load_projects(server_url)
+            return gr.update(choices=projects, value=None), gr.update(choices=[], value=None), "選擇專案後顯示資訊"
+
+        def focus_on_source_project_change(project_id, server_name):
+            """Handle focus mode source project selection."""
+            if not project_id:
+                return gr.update(choices=[], value=None), "選擇專案後顯示資訊"
+
+            try:
+                server_url = get_server_url_by_name(server_name)
+                client = get_cvat_client(server_url)
+                tasks = client.get_project_tasks(project_id)
+
+                task_choices = [(f"{t['name']} ({t['size']} 幀)", t['id']) for t in tasks]
+
+                # Get labels for info
+                labels = client.get_labels(project_id=project_id)
+                label_names = [l.get("name", "") for l in labels]
+
+                info = f"""
+**任務數量**: {len(tasks)}
+**標籤**: {', '.join(label_names) if label_names else '無'}
+"""
+                return gr.update(choices=task_choices, value=None), info
+            except Exception as e:
+                return gr.update(choices=[], value=None), f"錯誤: {str(e)}"
+
+        def focus_on_target_server_change(server_name):
+            """Handle focus mode target server change."""
+            server_url = get_server_url_by_name(server_name)
+            projects = load_projects(server_url)
+            return gr.update(choices=projects, value=None)
+
+        def focus_select_all_tasks(project_id, server_name):
+            """Select all tasks in focus mode."""
+            if not project_id:
+                return gr.update(value=None)
+
+            try:
+                server_url = get_server_url_by_name(server_name)
+                client = get_cvat_client(server_url)
+                tasks = client.get_project_tasks(project_id)
+                all_task_ids = [t['id'] for t in tasks]
+                return gr.update(value=all_task_ids)
+            except Exception:
+                return gr.update(value=None)
+
+        # Focus mode event bindings
+        focus_source_server.change(
+            fn=focus_on_source_server_change,
+            inputs=[focus_source_server],
+            outputs=[focus_source_project, focus_source_tasks, focus_source_info]
+        )
+
+        focus_refresh_source_btn.click(
+            fn=focus_on_source_server_change,
+            inputs=[focus_source_server],
+            outputs=[focus_source_project, focus_source_tasks, focus_source_info]
+        )
+
+        focus_source_project.change(
+            fn=focus_on_source_project_change,
+            inputs=[focus_source_project, focus_source_server],
+            outputs=[focus_source_tasks, focus_source_info]
+        )
+
+        focus_target_server.change(
+            fn=focus_on_target_server_change,
+            inputs=[focus_target_server],
+            outputs=[focus_target_project]
+        )
+
+        focus_refresh_target_btn.click(
+            fn=focus_on_target_server_change,
+            inputs=[focus_target_server],
+            outputs=[focus_target_project]
+        )
+
+        focus_select_all_btn.click(
+            fn=focus_select_all_tasks,
+            inputs=[focus_source_project, focus_source_server],
+            outputs=[focus_source_tasks]
+        )
+
+        focus_start_btn.click(
+            fn=start_focus_copy_tasks,
+            inputs=[
+                focus_source_project,
+                focus_source_server,
+                focus_source_tasks,
+                focus_target_project,
+                focus_target_server,
+                focus_label_name,
+                focus_mosaic_block_size,
+                focus_expand_pixels,
+                focus_task_name_prefix
+            ],
+            outputs=[focus_progress, focus_log]
         )
 
         # Load projects and job list on startup
